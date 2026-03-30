@@ -1,53 +1,44 @@
-# 444.HEIMAT-FUNK — Product Requirements Document
+# 444.HEIMAT-FUNK — Product Requirements Document v2.0
 
 ## Übersicht
-444.HEIMAT-FUNK ist ein militärisch-orientierter, sicherer Messaging-Dienst mit **anonymer Authentifizierung**. Keine E-Mail, keine Telefonnummer — nur Username + Passkey. DSGVO-konform by Design.
+Militärisch-orientierter, sicherer Messenger mit **anonymer Authentifizierung** und **Echtzeit-WebSocket-Messaging**. Zero-PII by Design. DSGVO-konform.
 
-## Technischer Stack
-- **Frontend**: React Native (Expo SDK 54) mit Expo Router
-- **Backend**: FastAPI (Python) mit Motor (async MongoDB)
+## Tech Stack
+- **Frontend**: React Native (Expo SDK 54) + Socket.IO Client
+- **Backend**: FastAPI + python-socketio + Motor (async MongoDB)
 - **Datenbank**: MongoDB (heimatfunk_db)
-- **Authentifizierung**: Anonym — Username + Passkey (bcrypt) + JWT
+- **Auth**: Anonym (Username + Passkey/bcrypt12 + JWT 1h/7d)
 
-## Auth-System: Anonym (Username + Passkey)
-- **Keine personenbezogenen Daten**: Kein Email, kein Telefon, kein Realname nötig
-- **Username**: 3-30 Zeichen, frei wählbar (a-z, 0-9, _, -, .)
-- **Passkey**: Min. 8 Zeichen, bcrypt-gehasht gespeichert
-- **JWT Token**: Nur user_id im Payload (keine E-Mail)
-- **Token-Blacklist**: Logout invalidiert Token sofort (MongoDB TTL)
-- **Rate Limiting**: 5 Versuche/IP + 3 Registrierungen/min/IP
+## v2.0 Features (NEU)
+- ✅ **WebSocket Echtzeit**: Socket.IO für message:new + typing Events
+- ✅ **Username-Generator**: `GET /api/auth/generate-username` → tier-hex (wolf-a3f2e1)
+- ✅ **Passkey-Ändern**: `POST /api/auth/change-passkey` im Settings-Screen
+- ✅ **DSGVO Account-Löschung**: `DELETE /api/auth/account` (komplett mit cascade)
+- ✅ **Refresh-Token**: `POST /api/auth/refresh` mit Cookie-Rotation
+- ✅ **Security Headers**: HSTS, X-Frame-Options, CSP, Referrer-Policy
+- ✅ **Anonymized Audit-Log**: SHA256(IP) statt raw IP
+- ✅ **bcrypt 12 Rounds**: 4x stärker gegen Brute-Force
 
-## Kernfunktionen
-- 1:1 Chats & Gruppenchats mit Echtzeit-Polling
-- Lesebestätigungen, Typing-Indikatoren
-- 4 Sicherheitsklassifizierungen (OFFEN/VS-NfD/VS-VERTRAULICH/GEHEIM)
-- Selbstzerstörende Nachrichten, NOTFALL-Kanal
-- Militärische Rollen (Kommandant/Offizier/Soldat)
-- Kontakt-Check bei Gruppenerstellung
-- Nachricht löschen, Gruppe verlassen
-- Security Audit-Log
-
-## API-Endpunkte
-### Auth (Anonym)
-- POST /api/auth/register {username, passkey, name, callsign?}
-- POST /api/auth/login {username, passkey}
-- POST /api/auth/logout
-- POST /api/auth/change-passkey {old_passkey, new_passkey}
-- GET /api/auth/me
-
-### Messaging
-- POST /api/messages, GET /api/messages/{chat_id}
-- POST /api/messages/read, DELETE /api/messages/{id}
-- GET /api/messages/poll/{chat_id}
-
-### Chats & Contacts
-- POST /api/chats, GET /api/chats, POST /api/chats/{id}/leave
-- POST /api/contacts/add, GET /api/contacts, DELETE /api/contacts/{id}
-
-## Security (3 Pentest-Runden)
-- JWT Secret: 128-Zeichen zufällig
+## Security (über 3 Pentest-Runden + Hardening)
+- JWT 128-Zeichen Secret, 1h Access + 7d Refresh
+- Token-Blacklist bei Logout (MongoDB TTL)
+- Rate Limiting: 5/IP Login + 3/IP Register
+- IDOR: Chat-Membership auf allen Endpoints
 - CORS: Nur Frontend-URL
-- IDOR: Alle Endpoints mit Chat-Membership-Check
-- Input Validation: Pydantic mit Whitelists
-- Rate Limiting: Atomic findOneAndUpdate
-- Token Blacklist bei Logout
+- Input Validation: Pydantic Whitelists
+
+## Endpoints
+### Auth
+- POST /api/auth/register, /api/auth/login, /api/auth/logout
+- POST /api/auth/change-passkey, /api/auth/refresh
+- GET /api/auth/me, /api/auth/generate-username
+- DELETE /api/auth/account
+
+### Messaging + WebSocket
+- POST /api/messages, GET /api/messages/{chat_id}
+- DELETE /api/messages/{id}
+- Socket.IO: message:new, typing Events
+
+## Login-Daten
+- Admin: `wolf-1` / `Funk2024!`
+- Test: `adler-2` / `Funk2024!`
