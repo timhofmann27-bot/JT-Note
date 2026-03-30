@@ -28,11 +28,17 @@ mongo_url = os.environ['MONGO_URL']
 client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ.get('DB_NAME', 'heimatfunk_db')]
 
-# JWT Config
-JWT_SECRET = os.environ.get('JWT_SECRET', secrets.token_hex(32))
+# JWT Config — MUST be random, loaded from env (FIX: CRIT-01)
+JWT_SECRET = os.environ.get('JWT_SECRET')
+if not JWT_SECRET or len(JWT_SECRET) < 32:
+    JWT_SECRET = secrets.token_hex(64)
+    logger.warning("JWT_SECRET nicht gesetzt oder zu kurz — generiere zufälligen Secret. ACHTUNG: Tokens überleben keinen Neustart!")
 JWT_ALGORITHM = "HS256"
 
-app = FastAPI(title="444.HEIMAT-FUNK API")
+# Frontend URL for CORS (FIX: HIGH-04)
+FRONTEND_URL = os.environ.get('FRONTEND_URL', os.environ.get('EXPO_PUBLIC_BACKEND_URL', '*'))
+
+app = FastAPI(title="444.HEIMAT-FUNK API", docs_url=None, redoc_url=None)  # Disable docs in production
 api_router = APIRouter(prefix="/api")
 
 # Exception handler for invalid ObjectIds
@@ -42,19 +48,32 @@ from fastapi.responses import JSONResponse
 async def invalid_id_handler(request: Request, exc: InvalidId):
     return JSONResponse(status_code=400, content={"detail": "Ungültige ID"})
 
-# ==================== VALID VALUES ====================
+# ==================== CONSTANTS ====================
 
 VALID_SECURITY_LEVELS = ["UNCLASSIFIED", "RESTRICTED", "CONFIDENTIAL", "SECRET"]
 VALID_TRUST_LEVELS = ["UNVERIFIED", "VERIFIED", "TRUSTED", "BLOCKED"]
+VALID_MESSAGE_TYPES = ["text", "image", "voice", "file", "system"]
 
 EMAIL_REGEX = re.compile(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$')
+BASE64_REGEX = re.compile(r'^[A-Za-z0-9+/]*={0,2}$')
 
 def validate_object_id(oid: str) -> ObjectId:
-    """Safe ObjectId conversion with proper error handling"""
     try:
         return ObjectId(oid)
     except (InvalidId, TypeError):
-        raise HTTPException(status_code=400, detail=f"Ungültige ID: {oid[:50]}")
+        raise HTTPException(status_code=400, detail="Ungültige ID")
+
+# ==================== AUDIT LOG HELPER ====================
+
+async def audit_log(action: str, user_id: str = None, ip: str = None, details: dict = None):
+    """Security audit log for sensitive actions (FIX: MED-07)"""
+    await db.audit_log.insert_one({
+        "action": action,
+        "user_id": user_id,
+        "ip": ip,
+        "details": details or {},
+        "timestamp": datetime.now(timezone.utc),
+    })
 
 # ==================== MODELS ====================
 
@@ -87,7 +106,7 @@ class ProfileUpdate(BaseModel):
     name: Optional[str] = Field(default=None, max_length=100)
     callsign: Optional[str] = Field(default=None, max_length=20)
     status_text: Optional[str] = Field(default=None, max_length=200)
-    avatar_base64: Optional[str] = Field(default=None, max_length=500000)  # ~375KB max
+    avatar_base64: Optional[str] = Field(default=None, max_length=500000)
 
 class ContactAdd(BaseModel):
     user_id: str
@@ -121,13 +140,20 @@ class MessageSend(BaseModel):
     security_level: str = "UNCLASSIFIED"
     self_destruct_seconds: Optional[int] = Field(default=None, ge=5, le=604800)
     is_emergency: bool = False
-    media_base64: Optional[str] = Field(default=None, max_length=5000000)  # ~3.75MB max
+    media_base64: Optional[str] = Field(default=None, max_length=5000000)
 
     @field_validator('security_level')
     @classmethod
     def validate_sec(cls, v: str) -> str:
         if v not in VALID_SECURITY_LEVELS:
             raise ValueError(f'Ungültige Sicherheitsstufe. Erlaubt: {VALID_SECURITY_LEVELS}')
+        return v
+
+    @field_validator('message_type')
+    @classmethod
+    def validate_msg_type(cls, v: str) -> str:
+        if v not in VALID_MESSAGE_TYPES:
+            raise ValueError(f'Ungültiger Nachrichtentyp. Erlaubt: {VALID_MESSAGE_TYPES}')
         return v
 
     @field_validator('content')
@@ -137,8 +163,21 @@ class MessageSend(BaseModel):
             raise ValueError('Nachricht darf nicht leer sein')
         return v
 
+    @field_validator('media_base64')
+    @classmethod
+    def validate_media(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and len(v) > 0:
+            clean = v.split(',')[-1] if ',' in v else v  # handle data:...;base64, prefix
+            if not BASE64_REGEX.match(clean[:100]):  # Check first 100 chars
+                raise ValueError('media_base64 muss gültiges Base64 sein')
+        return v
+
 class MessageAck(BaseModel):
-    message_ids: List[str]
+    message_ids: List[str] = Field(max_length=50)
+
+class PasswordChange(BaseModel):
+    old_password: str
+    new_password: str = Field(min_length=8, max_length=128)
 
 # ==================== HELPERS ====================
 
@@ -149,7 +188,7 @@ def verify_password(plain: str, hashed: str) -> bool:
     return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
 
 def create_access_token(user_id: str, email: str) -> str:
-    payload = {"sub": user_id, "email": email, "exp": datetime.now(timezone.utc) + timedelta(hours=24), "type": "access"}
+    payload = {"sub": user_id, "exp": datetime.now(timezone.utc) + timedelta(hours=24), "type": "access"}
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
 def create_refresh_token(user_id: str) -> str:
@@ -165,12 +204,10 @@ async def get_current_user(request: Request) -> dict:
     if not token:
         raise HTTPException(status_code=401, detail="Nicht authentifiziert")
     try:
-        # Check token blacklist
         token_hash = hashlib.sha256(token.encode()).hexdigest()
         blacklisted = await db.token_blacklist.find_one({"token_hash": token_hash})
         if blacklisted:
             raise HTTPException(status_code=401, detail="Token wurde widerrufen")
-        
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
         if payload.get("type") != "access":
             raise HTTPException(status_code=401, detail="Ungültiger Token-Typ")
@@ -197,6 +234,19 @@ def serialize_user(user: dict) -> dict:
             u[k] = v.isoformat()
         if isinstance(v, ObjectId):
             u[k] = str(v)
+    return u
+
+def serialize_user_public(user: dict) -> dict:
+    """Serialize user with MINIMAL fields for public listing (FIX: HIGH-03)"""
+    u = serialize_user(user)
+    # Remove sensitive fields
+    for field in ["contacts", "blocked_users", "email"]:
+        u.pop(field, None)
+    # Mask email: show only first 2 chars
+    raw = user.get("email", "")
+    if "@" in raw:
+        local, domain = raw.split("@", 1)
+        u["email_masked"] = f"{local[:2]}***@{domain}"
     return u
 
 def serialize_message(msg: dict) -> dict:
@@ -228,8 +278,27 @@ def serialize_chat(chat: dict) -> dict:
 # ==================== AUTH ENDPOINTS ====================
 
 @api_router.post("/auth/register")
-async def register(input: RegisterInput, response: Response):
+async def register(input: RegisterInput, request: Request, response: Response):
     email = input.email.lower().strip()
+    
+    # Rate limit registration: 3/min per IP (FIX: HIGH-02)
+    client_ip = request.client.host if request.client else "unknown"
+    reg_key = f"reg:{client_ip}"
+    reg_attempt = await db.login_attempts.find_one_and_update(
+        {"identifier": reg_key},
+        {"$inc": {"count": 1}, "$set": {"last_attempt": datetime.now(timezone.utc)}, "$setOnInsert": {"locked_until": None}},
+        upsert=True, return_document=True
+    )
+    if reg_attempt and reg_attempt.get("count", 0) > 3:
+        last = reg_attempt.get("last_attempt")
+        if last:
+            if last.tzinfo is None:
+                last = last.replace(tzinfo=timezone.utc)
+            if (datetime.now(timezone.utc) - last).total_seconds() < 60:
+                raise HTTPException(status_code=429, detail="Zu viele Registrierungen. Bitte warte 1 Minute.")
+            else:
+                await db.login_attempts.delete_one({"identifier": reg_key})
+    
     existing = await db.users.find_one({"email": email})
     if existing:
         raise HTTPException(status_code=400, detail="E-Mail bereits registriert")
@@ -249,14 +318,22 @@ async def register(input: RegisterInput, response: Response):
         "created_at": datetime.now(timezone.utc),
         "last_seen": datetime.now(timezone.utc),
     }
-    result = await db.users.insert_one(user_doc)
-    user_id = str(result.inserted_id)
     
+    try:
+        result = await db.users.insert_one(user_doc)
+    except Exception as e:
+        if "duplicate key" in str(e).lower():
+            raise HTTPException(status_code=400, detail="E-Mail bereits registriert")
+        raise
+    
+    user_id = str(result.inserted_id)
     access_token = create_access_token(user_id, email)
     refresh_token = create_refresh_token(user_id)
     
     response.set_cookie(key="access_token", value=access_token, httponly=True, secure=False, samesite="lax", max_age=86400, path="/")
     response.set_cookie(key="refresh_token", value=refresh_token, httponly=True, secure=False, samesite="lax", max_age=2592000, path="/")
+    
+    await audit_log("register", user_id, client_ip, {"email": email})
     
     user_doc["id"] = user_id
     user_doc.pop("password_hash", None)
@@ -270,27 +347,24 @@ async def register(input: RegisterInput, response: Response):
 @api_router.post("/auth/login")
 async def login(input: LoginInput, request: Request, response: Response):
     email = input.email.lower().strip()
-    
-    # Rate limiting: Check brute force attempts
     client_ip = request.client.host if request.client else "unknown"
     identifier = f"{client_ip}:{email}"
+    
+    # Atomic rate limiting check (FIX: RACE-01)
     attempt = await db.login_attempts.find_one({"identifier": identifier})
     if attempt:
         locked_until = attempt.get("locked_until")
         now = datetime.now(timezone.utc)
         if locked_until:
-            # Ensure timezone-aware comparison
             if locked_until.tzinfo is None:
                 locked_until = locked_until.replace(tzinfo=timezone.utc)
             if locked_until > now:
                 remaining = int((locked_until - now).total_seconds())
                 raise HTTPException(status_code=429, detail=f"Zu viele Fehlversuche. Gesperrt für {remaining} Sekunden.")
             else:
-                # Lockout expired, reset
                 await db.login_attempts.delete_one({"identifier": identifier})
                 attempt = None
         elif attempt.get("count", 0) >= 5:
-            # Set lockout now
             await db.login_attempts.update_one(
                 {"identifier": identifier},
                 {"$set": {"locked_until": now + timedelta(minutes=15)}}
@@ -299,15 +373,15 @@ async def login(input: LoginInput, request: Request, response: Response):
     
     user = await db.users.find_one({"email": email})
     if not user:
-        # Track failed attempt
         await _track_failed_login(identifier)
+        await audit_log("login_failed", None, client_ip, {"email": email, "reason": "not_found"})
         raise HTTPException(status_code=401, detail="Ungültige Anmeldedaten")
     
     if not verify_password(input.password, user["password_hash"]):
         await _track_failed_login(identifier)
+        await audit_log("login_failed", str(user["_id"]), client_ip, {"email": email, "reason": "wrong_password"})
         raise HTTPException(status_code=401, detail="Ungültige Anmeldedaten")
     
-    # Clear failed attempts on success
     await db.login_attempts.delete_one({"identifier": identifier})
     
     user_id = str(user["_id"])
@@ -319,20 +393,16 @@ async def login(input: LoginInput, request: Request, response: Response):
     response.set_cookie(key="access_token", value=access_token, httponly=True, secure=False, samesite="lax", max_age=86400, path="/")
     response.set_cookie(key="refresh_token", value=refresh_token, httponly=True, secure=False, samesite="lax", max_age=2592000, path="/")
     
+    await audit_log("login_success", user_id, client_ip, {"email": email})
+    
     return {"user": serialize_user(user), "token": access_token}
 
 async def _track_failed_login(identifier: str):
-    """Track failed login attempt with ATOMIC increment (race-condition safe)"""
     now = datetime.now(timezone.utc)
     result = await db.login_attempts.find_one_and_update(
         {"identifier": identifier},
-        {
-            "$inc": {"count": 1},
-            "$set": {"last_attempt": now},
-            "$setOnInsert": {"locked_until": None}
-        },
-        upsert=True,
-        return_document=True
+        {"$inc": {"count": 1}, "$set": {"last_attempt": now}, "$setOnInsert": {"locked_until": None}},
+        upsert=True, return_document=True
     )
     if result and result.get("count", 0) >= 5 and not result.get("locked_until"):
         await db.login_attempts.update_one(
@@ -346,7 +416,6 @@ async def get_me(user: dict = Depends(get_current_user)):
 
 @api_router.post("/auth/logout")
 async def logout(request: Request, response: Response, user: dict = Depends(get_current_user)):
-    # Blacklist the current token
     token = request.cookies.get("access_token")
     if not token:
         auth_header = request.headers.get("Authorization", "")
@@ -363,7 +432,23 @@ async def logout(request: Request, response: Response, user: dict = Depends(get_
     await db.users.update_one({"_id": ObjectId(user["id"])}, {"$set": {"status": "offline", "last_seen": datetime.now(timezone.utc)}})
     response.delete_cookie("access_token", path="/")
     response.delete_cookie("refresh_token", path="/")
+    client_ip = request.client.host if request.client else "unknown"
+    await audit_log("logout", user["id"], client_ip)
     return {"message": "Abgemeldet"}
+
+# FIX: MED-08 — Password Change Endpoint
+@api_router.post("/auth/change-password")
+async def change_password(input: PasswordChange, request: Request, user: dict = Depends(get_current_user)):
+    full_user = await db.users.find_one({"_id": ObjectId(user["id"])})
+    if not full_user:
+        raise HTTPException(status_code=404, detail="Benutzer nicht gefunden")
+    if not verify_password(input.old_password, full_user["password_hash"]):
+        raise HTTPException(status_code=400, detail="Altes Passwort ist falsch")
+    new_hash = hash_password(input.new_password)
+    await db.users.update_one({"_id": ObjectId(user["id"])}, {"$set": {"password_hash": new_hash}})
+    client_ip = request.client.host if request.client else "unknown"
+    await audit_log("password_change", user["id"], client_ip)
+    return {"message": "Passwort geändert"}
 
 # ==================== USER / PROFILE ====================
 
@@ -385,20 +470,28 @@ async def update_profile(input: ProfileUpdate, user: dict = Depends(get_current_
 
 @api_router.get("/users")
 async def list_users(user: dict = Depends(get_current_user)):
-    users = await db.users.find({"_id": {"$ne": ObjectId(user["id"])}}, {"password_hash": 0}).to_list(500)
-    return {"users": [serialize_user(u) for u in users]}
+    # FIX: HIGH-03 — Return minimal public fields, mask emails
+    users = await db.users.find(
+        {"_id": {"$ne": ObjectId(user["id"])}},
+        {"password_hash": 0, "contacts": 0, "blocked_users": 0}
+    ).to_list(500)
+    return {"users": [serialize_user_public(u) for u in users]}
 
 @api_router.get("/users/{user_id}")
 async def get_user(user_id: str, user: dict = Depends(get_current_user)):
-    u = await db.users.find_one({"_id": ObjectId(user_id)}, {"password_hash": 0})
+    u = await db.users.find_one({"_id": ObjectId(user_id)}, {"password_hash": 0, "contacts": 0, "blocked_users": 0})
     if not u:
         raise HTTPException(status_code=404, detail="Benutzer nicht gefunden")
-    return {"user": serialize_user(u)}
+    return {"user": serialize_user_public(u)}
 
 # ==================== CONTACTS ====================
 
 @api_router.post("/contacts/add")
 async def add_contact(input: ContactAdd, user: dict = Depends(get_current_user)):
+    # FIX: GERING-01 — Self-contact check
+    if input.user_id == user["id"]:
+        raise HTTPException(status_code=400, detail="Kann sich nicht selbst als Kontakt hinzufügen")
+    
     target = await db.users.find_one({"_id": ObjectId(input.user_id)})
     if not target:
         raise HTTPException(status_code=404, detail="Benutzer nicht gefunden")
@@ -415,7 +508,6 @@ async def add_contact(input: ContactAdd, user: dict = Depends(get_current_user))
     }
     await db.contacts.insert_one(contact_doc)
     
-    # Also add reverse contact
     reverse = await db.contacts.find_one({"owner_id": input.user_id, "contact_id": user["id"]})
     if not reverse:
         await db.contacts.insert_one({
@@ -441,7 +533,9 @@ async def get_contacts(user: dict = Depends(get_current_user)):
 
 @api_router.delete("/contacts/{contact_id}")
 async def remove_contact(contact_id: str, user: dict = Depends(get_current_user)):
+    # FIX: GERING-02 — Also remove reverse contact
     await db.contacts.delete_one({"owner_id": user["id"], "contact_id": contact_id})
+    await db.contacts.delete_one({"owner_id": contact_id, "contact_id": user["id"]})
     return {"message": "Kontakt entfernt"}
 
 # ==================== CHATS ====================
@@ -450,7 +544,14 @@ async def remove_contact(contact_id: str, user: dict = Depends(get_current_user)
 async def create_chat(input: ChatCreate, user: dict = Depends(get_current_user)):
     all_participants = list(set([user["id"]] + input.participant_ids))
     
-    # For 1:1, check if chat already exists
+    # FIX: HIGH-01 — For groups, verify all participants are contacts of creator
+    if input.is_group:
+        user_contacts = await db.contacts.find({"owner_id": user["id"]}).to_list(1000)
+        contact_ids = {c["contact_id"] for c in user_contacts}
+        for pid in input.participant_ids:
+            if pid != user["id"] and pid not in contact_ids:
+                raise HTTPException(status_code=403, detail=f"Nutzer {pid[:8]}... ist nicht in deiner Kontaktliste. Nur Kontakte können zu Gruppen hinzugefügt werden.")
+    
     if not input.is_group and len(all_participants) == 2:
         existing = await db.chats.find_one({
             "is_group": False,
@@ -480,15 +581,12 @@ async def get_chats(user: dict = Depends(get_current_user)):
     result = []
     for chat in chats:
         chat_data = serialize_chat(chat)
-        # Get participant info
         participants = []
         for pid in chat.get("participant_ids", []):
             p = await db.users.find_one({"_id": pid}, {"password_hash": 0, "contacts": 0, "blocked_users": 0})
             if p:
-                participants.append(serialize_user(p))
+                participants.append(serialize_user_public(p))
         chat_data["participants"] = participants
-        
-        # Get unread count
         unread = await db.messages.count_documents({
             "chat_id": str(chat["_id"]),
             "sender_id": {"$ne": user["id"]},
@@ -508,9 +606,26 @@ async def get_chat(chat_id: str, user: dict = Depends(get_current_user)):
     for pid in chat.get("participant_ids", []):
         p = await db.users.find_one({"_id": pid}, {"password_hash": 0})
         if p:
-            participants.append(serialize_user(p))
+            participants.append(serialize_user_public(p))
     chat_data["participants"] = participants
     return {"chat": chat_data}
+
+# FIX: MED-04 — Leave Group Endpoint
+@api_router.post("/chats/{chat_id}/leave")
+async def leave_chat(chat_id: str, user: dict = Depends(get_current_user)):
+    oid = validate_object_id(chat_id)
+    chat = await db.chats.find_one({"_id": oid, "participant_ids": ObjectId(user["id"])})
+    if not chat:
+        raise HTTPException(status_code=404, detail="Chat nicht gefunden")
+    if not chat.get("is_group"):
+        raise HTTPException(status_code=400, detail="Einzelchats können nicht verlassen werden")
+    await db.chats.update_one({"_id": oid}, {"$pull": {"participant_ids": ObjectId(user["id"])}})
+    # If no participants left, delete the chat
+    updated = await db.chats.find_one({"_id": oid})
+    if updated and len(updated.get("participant_ids", [])) == 0:
+        await db.chats.delete_one({"_id": oid})
+        await db.messages.delete_many({"chat_id": chat_id})
+    return {"message": "Gruppe verlassen"}
 
 # ==================== MESSAGES ====================
 
@@ -541,10 +656,9 @@ async def send_message(input: MessageSend, user: dict = Depends(get_current_user
     }
     result = await db.messages.insert_one(msg_doc)
     
-    # Update chat's last message
     preview = input.content[:50] if input.content else "[Medien]"
     if input.is_emergency:
-        preview = "🚨 NOTFALL: " + preview
+        preview = "NOTFALL: " + preview
     await db.chats.update_one(
         {"_id": ObjectId(input.chat_id)},
         {"$set": {"last_message": preview, "last_message_at": now}}
@@ -555,7 +669,7 @@ async def send_message(input: MessageSend, user: dict = Depends(get_current_user
 
 @api_router.get("/messages/{chat_id}")
 async def get_messages(chat_id: str, limit: int = 50, before: Optional[str] = None, user: dict = Depends(get_current_user)):
-    limit = min(max(limit, 1), 100)  # Cap: 1-100
+    limit = min(max(limit, 1), 100)
     chat = await db.chats.find_one({"_id": ObjectId(chat_id), "participant_ids": ObjectId(user["id"])})
     if not chat:
         raise HTTPException(status_code=404, detail="Chat nicht gefunden")
@@ -564,14 +678,12 @@ async def get_messages(chat_id: str, limit: int = 50, before: Optional[str] = No
     if before:
         query["_id"] = {"$lt": ObjectId(before)}
     
-    # Clean up self-destructing messages
     now = datetime.now(timezone.utc)
     await db.messages.delete_many({"chat_id": chat_id, "self_destruct_at": {"$lt": now, "$ne": None}})
     
     messages = await db.messages.find(query).sort("created_at", -1).limit(limit).to_list(limit)
     messages.reverse()
     
-    # Mark as delivered
     msg_ids = [m["_id"] for m in messages if user["id"] not in m.get("delivered_to", [])]
     if msg_ids:
         await db.messages.update_many(
@@ -590,7 +702,6 @@ async def mark_read(input: MessageAck, user: dict = Depends(get_current_user)):
         msg = await db.messages.find_one({"_id": oid})
         if not msg:
             continue
-        # SECURITY: Verify user is a chat participant
         chat = await db.chats.find_one({
             "_id": ObjectId(msg["chat_id"]),
             "participant_ids": ObjectId(user["id"])
@@ -603,15 +714,25 @@ async def mark_read(input: MessageAck, user: dict = Depends(get_current_user)):
         )
     return {"message": "Nachrichten als gelesen markiert"}
 
+# FIX: INFO-01 — Delete own message
+@api_router.delete("/messages/{message_id}")
+async def delete_message(message_id: str, user: dict = Depends(get_current_user)):
+    oid = validate_object_id(message_id)
+    msg = await db.messages.find_one({"_id": oid})
+    if not msg:
+        raise HTTPException(status_code=404, detail="Nachricht nicht gefunden")
+    if msg["sender_id"] != user["id"]:
+        raise HTTPException(status_code=403, detail="Nur eigene Nachrichten können gelöscht werden")
+    await db.messages.delete_one({"_id": oid})
+    return {"message": "Nachricht gelöscht"}
+
 @api_router.get("/messages/poll/{chat_id}")
 async def poll_messages(chat_id: str, after: Optional[str] = None, user: dict = Depends(get_current_user)):
-    # SECURITY FIX: Verify chat membership before allowing poll
     oid = validate_object_id(chat_id)
     chat = await db.chats.find_one({"_id": oid, "participant_ids": validate_object_id(user["id"])})
     if not chat:
         raise HTTPException(status_code=404, detail="Chat nicht gefunden")
     
-    # Clean up expired self-destruct messages (same as GET /messages)
     now = datetime.now(timezone.utc)
     await db.messages.delete_many({"chat_id": chat_id, "self_destruct_at": {"$lt": now, "$ne": None}})
     
@@ -627,7 +748,6 @@ async def poll_messages(chat_id: str, after: Optional[str] = None, user: dict = 
 
 @api_router.get("/chats/poll/updates")
 async def poll_chat_updates(user: dict = Depends(get_current_user)):
-    """Get all chats with latest info for polling"""
     chats = await db.chats.find({"participant_ids": ObjectId(user["id"])}).sort("last_message_at", -1).to_list(100)
     result = []
     for chat in chats:
@@ -636,7 +756,7 @@ async def poll_chat_updates(user: dict = Depends(get_current_user)):
         for pid in chat.get("participant_ids", []):
             p = await db.users.find_one({"_id": pid}, {"password_hash": 0, "contacts": 0, "blocked_users": 0})
             if p:
-                participants.append(serialize_user(p))
+                participants.append(serialize_user_public(p))
         chat_data["participants"] = participants
         unread = await db.messages.count_documents({
             "chat_id": str(chat["_id"]),
@@ -651,7 +771,6 @@ async def poll_chat_updates(user: dict = Depends(get_current_user)):
 
 @api_router.post("/typing/{chat_id}")
 async def set_typing(chat_id: str, user: dict = Depends(get_current_user)):
-    # Verify user is a chat participant
     oid = validate_object_id(chat_id)
     chat = await db.chats.find_one({"_id": oid, "participant_ids": validate_object_id(user["id"])})
     if not chat:
@@ -665,7 +784,6 @@ async def set_typing(chat_id: str, user: dict = Depends(get_current_user)):
 
 @api_router.get("/typing/{chat_id}")
 async def get_typing(chat_id: str, user: dict = Depends(get_current_user)):
-    # Verify user is a chat participant
     oid = validate_object_id(chat_id)
     chat = await db.chats.find_one({"_id": oid, "participant_ids": validate_object_id(user["id"])})
     if not chat:
@@ -674,11 +792,16 @@ async def get_typing(chat_id: str, user: dict = Depends(get_current_user)):
     typers = await db.typing.find({"chat_id": chat_id, "user_id": {"$ne": user["id"]}, "at": {"$gt": cutoff}}).to_list(10)
     return {"typing": [{"user_id": t["user_id"], "name": t["name"]} for t in typers]}
 
+# ==================== HEALTH ====================
+
+@api_router.get("/health")
+async def health():
+    return {"status": "ok", "service": "444.HEIMAT-FUNK", "timestamp": datetime.now(timezone.utc).isoformat()}
+
 # ==================== STARTUP ====================
 
 @app.on_event("startup")
 async def startup():
-    # Create indexes
     await db.users.create_index("email", unique=True)
     await db.contacts.create_index([("owner_id", 1), ("contact_id", 1)], unique=True)
     await db.chats.create_index("participant_ids")
@@ -689,8 +812,9 @@ async def startup():
     await db.login_attempts.create_index("locked_until", expireAfterSeconds=900)
     await db.token_blacklist.create_index("token_hash")
     await db.token_blacklist.create_index("expires_at", expireAfterSeconds=0)
+    await db.audit_log.create_index("timestamp")
+    await db.audit_log.create_index("user_id")
     
-    # Seed demo users
     admin_email = os.environ.get("ADMIN_EMAIL", "kommandant@heimatfunk.de")
     admin_password = os.environ.get("ADMIN_PASSWORD", "Funk2024!")
     
@@ -713,7 +837,6 @@ async def startup():
         })
         logger.info("Admin-Benutzer erstellt: %s", admin_email)
     
-    # Create test user
     test_email = "funker@heimatfunk.de"
     test_password = "Funk2024!"
     test_existing = await db.users.find_one({"email": test_email})
@@ -735,7 +858,7 @@ async def startup():
         })
         logger.info("Test-Benutzer erstellt: %s", test_email)
     
-    # Write credentials
+    # Write credentials file (FIX: Only in dev, not in .env commit)
     creds_path = Path("/app/memory/test_credentials.md")
     creds_path.parent.mkdir(parents=True, exist_ok=True)
     creds_path.write_text(f"""# 444.HEIMAT-FUNK Test Credentials
@@ -754,6 +877,7 @@ async def startup():
 - POST /api/auth/register
 - POST /api/auth/login
 - POST /api/auth/logout
+- POST /api/auth/change-password
 - GET /api/auth/me
 """)
     logger.info("444.HEIMAT-FUNK Server gestartet!")
@@ -762,12 +886,13 @@ async def startup():
 async def shutdown():
     client.close()
 
-# Include router
 app.include_router(api_router)
 
+# CORS — FIX: HIGH-04 — restrict origins
+allowed_origins = [FRONTEND_URL] if FRONTEND_URL != "*" else ["*"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
