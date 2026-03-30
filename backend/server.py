@@ -3,6 +3,7 @@ load_dotenv()
 
 from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depends
 from starlette.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
 from bson.errors import InvalidId
@@ -14,6 +15,7 @@ import secrets
 import json
 import re
 import hashlib
+import random
 from pathlib import Path
 from pydantic import BaseModel, Field, field_validator
 from typing import List, Optional
@@ -27,15 +29,35 @@ client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ.get('DB_NAME', 'heimatfunk_db')]
 
 JWT_SECRET = os.environ.get('JWT_SECRET')
-if not JWT_SECRET or len(JWT_SECRET) < 32:
+if not JWT_SECRET or len(JWT_SECRET) < 64:
     JWT_SECRET = secrets.token_hex(64)
-    logger.warning("JWT_SECRET zu kurz — generiere zufälligen Secret.")
+    logger.warning("JWT_SECRET zu kurz — generiere zufälligen 128-char Secret.")
 JWT_ALGORITHM = "HS256"
+ACCESS_TOKEN_MINUTES = 60       # 1h statt 24h (Security Upgrade)
+REFRESH_TOKEN_DAYS = 7          # 7 Tage statt 30
 
 FRONTEND_URL = os.environ.get('FRONTEND_URL', os.environ.get('EXPO_PUBLIC_BACKEND_URL', '*'))
+BCRYPT_ROUNDS = 12              # Erhöht von Default 10
 
 app = FastAPI(title="444.HEIMAT-FUNK API", docs_url=None, redoc_url=None)
 api_router = APIRouter(prefix="/api")
+
+# ==================== SECURITY MIDDLEWARE ====================
+
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    """Add security headers to every response"""
+    async def dispatch(self, request, call_next):
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["X-XSS-Protection"] = "1; mode=block"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+        return response
+
+app.add_middleware(SecurityHeadersMiddleware)
 
 from fastapi.responses import JSONResponse
 
@@ -56,8 +78,30 @@ def validate_object_id(oid: str) -> ObjectId:
     except (InvalidId, TypeError):
         raise HTTPException(status_code=400, detail="Ungültige ID")
 
+def anonymize_ip(ip: str) -> str:
+    """Hash IP for privacy — never store raw IPs"""
+    return hashlib.sha256(ip.encode()).hexdigest()[:16]
+
 async def audit_log(action: str, user_id: str = None, ip: str = None, details: dict = None):
-    await db.audit_log.insert_one({"action": action, "user_id": user_id, "ip": ip, "details": details or {}, "timestamp": datetime.now(timezone.utc)})
+    """Security audit with anonymized IP (never stores raw IP)"""
+    await db.audit_log.insert_one({
+        "action": action,
+        "user_id": user_id,
+        "ip_hash": anonymize_ip(ip) if ip else None,  # ANONYMIZED — no raw IP
+        "details": details or {},
+        "timestamp": datetime.now(timezone.utc),
+    })
+
+# ==================== USERNAME GENERATOR ====================
+
+ANIMALS_DE = ["wolf", "adler", "falke", "luchs", "baer", "fuchs", "habicht", "marder", "uhu", "otter",
+              "dachs", "rabe", "sperber", "wisent", "elch", "biber", "drossel", "greif", "panther", "viper"]
+
+def generate_username() -> str:
+    """Generate anonymous username: tier-hexcode (e.g. wolf-a3f2e1)"""
+    animal = random.choice(ANIMALS_DE)
+    hex_code = secrets.token_hex(3)  # 6 hex chars
+    return f"{animal}-{hex_code}"
 
 # ==================== MODELS (ANONYMOUS AUTH) ====================
 
@@ -160,16 +204,16 @@ class PasskeyChange(BaseModel):
 # ==================== HELPERS ====================
 
 def hash_password(password: str) -> str:
-    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt(rounds=BCRYPT_ROUNDS)).decode("utf-8")
 
 def verify_password(plain: str, hashed: str) -> bool:
     return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
 
 def create_access_token(user_id: str) -> str:
-    return jwt.encode({"sub": user_id, "exp": datetime.now(timezone.utc) + timedelta(hours=24), "type": "access"}, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    return jwt.encode({"sub": user_id, "exp": datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_MINUTES), "type": "access", "jti": secrets.token_hex(8)}, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
 def create_refresh_token(user_id: str) -> str:
-    return jwt.encode({"sub": user_id, "exp": datetime.now(timezone.utc) + timedelta(days=30), "type": "refresh"}, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    return jwt.encode({"sub": user_id, "exp": datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_DAYS), "type": "refresh", "jti": secrets.token_hex(8)}, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
 async def get_current_user(request: Request) -> dict:
     token = request.cookies.get("access_token")
@@ -290,8 +334,10 @@ async def register(input: RegisterInput, request: Request, response: Response):
     
     user_id = str(result.inserted_id)
     access_token = create_access_token(user_id)
+    refresh_token = create_refresh_token(user_id)
     
-    response.set_cookie(key="access_token", value=access_token, httponly=True, secure=False, samesite="lax", max_age=86400, path="/")
+    response.set_cookie(key="access_token", value=access_token, httponly=True, secure=False, samesite="lax", max_age=ACCESS_TOKEN_MINUTES*60, path="/")
+    response.set_cookie(key="refresh_token", value=refresh_token, httponly=True, secure=False, samesite="lax", max_age=REFRESH_TOKEN_DAYS*86400, path="/")
     
     await audit_log("register", user_id, client_ip, {"username": username})
     
@@ -341,7 +387,9 @@ async def login(input: LoginInput, request: Request, response: Response):
     await db.users.update_one({"_id": user["_id"]}, {"$set": {"status": "online", "last_seen": datetime.now(timezone.utc)}})
     
     access_token = create_access_token(user_id)
-    response.set_cookie(key="access_token", value=access_token, httponly=True, secure=False, samesite="lax", max_age=86400, path="/")
+    refresh_token = create_refresh_token(user_id)
+    response.set_cookie(key="access_token", value=access_token, httponly=True, secure=False, samesite="lax", max_age=ACCESS_TOKEN_MINUTES*60, path="/")
+    response.set_cookie(key="refresh_token", value=refresh_token, httponly=True, secure=False, samesite="lax", max_age=REFRESH_TOKEN_DAYS*86400, path="/")
     
     await audit_log("login_success", user_id, client_ip, {"username": username})
     return {"user": serialize_user(user), "token": access_token}
@@ -624,6 +672,74 @@ async def get_typing(chat_id: str, user: dict = Depends(get_current_user)):
 @api_router.get("/health")
 async def health():
     return {"status": "ok", "service": "444.HEIMAT-FUNK", "timestamp": datetime.now(timezone.utc).isoformat()}
+
+# ==================== USERNAME GENERATOR ====================
+
+@api_router.get("/auth/generate-username")
+async def gen_username():
+    """Generate a random anonymous username"""
+    for _ in range(10):
+        candidate = generate_username()
+        existing = await db.users.find_one({"username": candidate})
+        if not existing:
+            return {"username": candidate}
+    return {"username": generate_username() + secrets.token_hex(2)}
+
+# ==================== REFRESH TOKEN ====================
+
+@api_router.post("/auth/refresh")
+async def refresh_token(request: Request, response: Response):
+    """Issue new access token using refresh token"""
+    token = request.cookies.get("refresh_token")
+    if not token:
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            token = auth_header[7:]
+    if not token:
+        raise HTTPException(status_code=401, detail="Kein Refresh-Token")
+    try:
+        token_hash = hashlib.sha256(token.encode()).hexdigest()
+        blacklisted = await db.token_blacklist.find_one({"token_hash": token_hash})
+        if blacklisted:
+            raise HTTPException(status_code=401, detail="Token widerrufen")
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        if payload.get("type") != "refresh":
+            raise HTTPException(status_code=401, detail="Kein Refresh-Token")
+        user = await db.users.find_one({"_id": ObjectId(payload["sub"])})
+        if not user:
+            raise HTTPException(status_code=401, detail="Benutzer nicht gefunden")
+        # Issue new access token
+        user_id = str(user["_id"])
+        new_access = create_access_token(user_id)
+        response.set_cookie(key="access_token", value=new_access, httponly=True, secure=False, samesite="lax", max_age=ACCESS_TOKEN_MINUTES*60, path="/")
+        return {"token": new_access, "user": serialize_user(user)}
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Refresh-Token abgelaufen")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Ungültiger Refresh-Token")
+
+# ==================== ACCOUNT DELETION (DSGVO) ====================
+
+@api_router.delete("/auth/account")
+async def delete_account(request: Request, response: Response, user: dict = Depends(get_current_user)):
+    """DSGVO: Vollständige Account-Löschung"""
+    uid = user["id"]
+    # Delete all user data
+    await db.messages.delete_many({"sender_id": uid})
+    await db.contacts.delete_many({"$or": [{"owner_id": uid}, {"contact_id": uid}]})
+    await db.chats.update_many({"participant_ids": ObjectId(uid)}, {"$pull": {"participant_ids": ObjectId(uid)}})
+    # Delete empty chats
+    empty = await db.chats.find({"participant_ids": {"$size": 0}}).to_list(1000)
+    for c in empty:
+        await db.messages.delete_many({"chat_id": str(c["_id"])})
+        await db.chats.delete_one({"_id": c["_id"]})
+    await db.typing.delete_many({"user_id": uid})
+    await db.users.delete_one({"_id": ObjectId(uid)})
+    response.delete_cookie("access_token", path="/")
+    response.delete_cookie("refresh_token", path="/")
+    client_ip = request.client.host if request.client else "unknown"
+    await audit_log("account_deleted", uid, client_ip)
+    return {"message": "Account und alle Daten gelöscht"}
 
 # ==================== STARTUP ====================
 
