@@ -13,6 +13,7 @@ import jwt
 import secrets
 import json
 import re
+import hashlib
 from pathlib import Path
 from pydantic import BaseModel, Field, field_validator
 from typing import List, Optional, Literal
@@ -164,6 +165,12 @@ async def get_current_user(request: Request) -> dict:
     if not token:
         raise HTTPException(status_code=401, detail="Nicht authentifiziert")
     try:
+        # Check token blacklist
+        token_hash = hashlib.sha256(token.encode()).hexdigest()
+        blacklisted = await db.token_blacklist.find_one({"token_hash": token_hash})
+        if blacklisted:
+            raise HTTPException(status_code=401, detail="Token wurde widerrufen")
+        
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
         if payload.get("type") != "access":
             raise HTTPException(status_code=401, detail="Ungültiger Token-Typ")
@@ -315,28 +322,44 @@ async def login(input: LoginInput, request: Request, response: Response):
     return {"user": serialize_user(user), "token": access_token}
 
 async def _track_failed_login(identifier: str):
-    """Track failed login attempt for brute force protection"""
-    attempt = await db.login_attempts.find_one({"identifier": identifier})
-    if attempt:
-        new_count = attempt.get("count", 0) + 1
-        update: dict = {"$set": {"count": new_count, "last_attempt": datetime.now(timezone.utc)}}
-        if new_count >= 5:
-            update["$set"]["locked_until"] = datetime.now(timezone.utc) + timedelta(minutes=15)
-        await db.login_attempts.update_one({"identifier": identifier}, update)
-    else:
-        await db.login_attempts.insert_one({
-            "identifier": identifier,
-            "count": 1,
-            "last_attempt": datetime.now(timezone.utc),
-            "locked_until": None,
-        })
+    """Track failed login attempt with ATOMIC increment (race-condition safe)"""
+    now = datetime.now(timezone.utc)
+    result = await db.login_attempts.find_one_and_update(
+        {"identifier": identifier},
+        {
+            "$inc": {"count": 1},
+            "$set": {"last_attempt": now},
+            "$setOnInsert": {"locked_until": None}
+        },
+        upsert=True,
+        return_document=True
+    )
+    if result and result.get("count", 0) >= 5 and not result.get("locked_until"):
+        await db.login_attempts.update_one(
+            {"identifier": identifier},
+            {"$set": {"locked_until": now + timedelta(minutes=15)}}
+        )
 
 @api_router.get("/auth/me")
 async def get_me(user: dict = Depends(get_current_user)):
     return {"user": user}
 
 @api_router.post("/auth/logout")
-async def logout(response: Response, user: dict = Depends(get_current_user)):
+async def logout(request: Request, response: Response, user: dict = Depends(get_current_user)):
+    # Blacklist the current token
+    token = request.cookies.get("access_token")
+    if not token:
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            token = auth_header[7:]
+    if token:
+        token_hash = hashlib.sha256(token.encode()).hexdigest()
+        await db.token_blacklist.insert_one({
+            "token_hash": token_hash,
+            "user_id": user["id"],
+            "blacklisted_at": datetime.now(timezone.utc),
+            "expires_at": datetime.now(timezone.utc) + timedelta(hours=24),
+        })
     await db.users.update_one({"_id": ObjectId(user["id"])}, {"$set": {"status": "offline", "last_seen": datetime.now(timezone.utc)}})
     response.delete_cookie("access_token", path="/")
     response.delete_cookie("refresh_token", path="/")
@@ -532,6 +555,7 @@ async def send_message(input: MessageSend, user: dict = Depends(get_current_user
 
 @api_router.get("/messages/{chat_id}")
 async def get_messages(chat_id: str, limit: int = 50, before: Optional[str] = None, user: dict = Depends(get_current_user)):
+    limit = min(max(limit, 1), 100)  # Cap: 1-100
     chat = await db.chats.find_one({"_id": ObjectId(chat_id), "participant_ids": ObjectId(user["id"])})
     if not chat:
         raise HTTPException(status_code=404, detail="Chat nicht gefunden")
@@ -559,12 +583,24 @@ async def get_messages(chat_id: str, limit: int = 50, before: Optional[str] = No
 
 @api_router.post("/messages/read")
 async def mark_read(input: MessageAck, user: dict = Depends(get_current_user)):
+    if len(input.message_ids) > 50:
+        raise HTTPException(status_code=400, detail="Maximal 50 Nachrichten pro Request")
     for mid in input.message_ids:
+        oid = validate_object_id(mid)
+        msg = await db.messages.find_one({"_id": oid})
+        if not msg:
+            continue
+        # SECURITY: Verify user is a chat participant
+        chat = await db.chats.find_one({
+            "_id": ObjectId(msg["chat_id"]),
+            "participant_ids": ObjectId(user["id"])
+        })
+        if not chat:
+            continue
         await db.messages.update_one(
-            {"_id": ObjectId(mid)},
+            {"_id": oid},
             {"$addToSet": {"read_by": user["id"]}}
         )
-    # Update status to read if all participants have read
     return {"message": "Nachrichten als gelesen markiert"}
 
 @api_router.get("/messages/poll/{chat_id}")
@@ -574,6 +610,10 @@ async def poll_messages(chat_id: str, after: Optional[str] = None, user: dict = 
     chat = await db.chats.find_one({"_id": oid, "participant_ids": validate_object_id(user["id"])})
     if not chat:
         raise HTTPException(status_code=404, detail="Chat nicht gefunden")
+    
+    # Clean up expired self-destruct messages (same as GET /messages)
+    now = datetime.now(timezone.utc)
+    await db.messages.delete_many({"chat_id": chat_id, "self_destruct_at": {"$lt": now, "$ne": None}})
     
     query: dict = {"chat_id": chat_id}
     if after:
@@ -647,6 +687,8 @@ async def startup():
     await db.typing.create_index("at", expireAfterSeconds=10)
     await db.login_attempts.create_index("identifier")
     await db.login_attempts.create_index("locked_until", expireAfterSeconds=900)
+    await db.token_blacklist.create_index("token_hash")
+    await db.token_blacklist.create_index("expires_at", expireAfterSeconds=0)
     
     # Seed demo users
     admin_email = os.environ.get("ADMIN_EMAIL", "kommandant@heimatfunk.de")
