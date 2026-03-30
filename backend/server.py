@@ -788,10 +788,15 @@ async def refresh_token(request: Request, response: Response):
         user = await db.users.find_one({"_id": ObjectId(payload["sub"])})
         if not user:
             raise HTTPException(status_code=401, detail="Benutzer nicht gefunden")
-        # Issue new access token
+        # Issue new access token + ROTATE refresh token (invalidate old)
         user_id = str(user["_id"])
         new_access = create_access_token(user_id)
+        new_refresh = create_refresh_token(user_id)
+        # Blacklist old refresh token
+        old_hash = hashlib.sha256(token.encode()).hexdigest()
+        await db.token_blacklist.insert_one({"token_hash": old_hash, "user_id": user_id, "blacklisted_at": datetime.now(timezone.utc), "expires_at": datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_DAYS)})
         response.set_cookie(key="access_token", value=new_access, httponly=True, secure=False, samesite="lax", max_age=ACCESS_TOKEN_MINUTES*60, path="/")
+        response.set_cookie(key="refresh_token", value=new_refresh, httponly=True, secure=False, samesite="lax", max_age=REFRESH_TOKEN_DAYS*86400, path="/")
         return {"token": new_access, "user": serialize_user(user)}
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Refresh-Token abgelaufen")
@@ -804,11 +809,9 @@ async def refresh_token(request: Request, response: Response):
 async def delete_account(request: Request, response: Response, user: dict = Depends(get_current_user)):
     """DSGVO: Vollständige Account-Löschung"""
     uid = user["id"]
-    # Delete all user data
     await db.messages.delete_many({"sender_id": uid})
     await db.contacts.delete_many({"$or": [{"owner_id": uid}, {"contact_id": uid}]})
     await db.chats.update_many({"participant_ids": ObjectId(uid)}, {"$pull": {"participant_ids": ObjectId(uid)}})
-    # Delete empty chats
     empty = await db.chats.find({"participant_ids": {"$size": 0}}).to_list(1000)
     for c in empty:
         await db.messages.delete_many({"chat_id": str(c["_id"])})
@@ -820,6 +823,89 @@ async def delete_account(request: Request, response: Response, user: dict = Depe
     client_ip = request.client.host if request.client else "unknown"
     await audit_log("account_deleted", uid, client_ip)
     return {"message": "Account und alle Daten gelöscht"}
+
+# ==================== QR MAGIC LINKS (Device-to-Device) ====================
+
+import qrcode
+import io
+import base64
+
+@api_router.post("/auth/magic-qr")
+async def create_magic_qr(request: Request, user: dict = Depends(get_current_user)):
+    """Generate QR code for cross-device login. Scanned device gets auto-logged in."""
+    magic_token = secrets.token_urlsafe(32)
+    await db.magic_tokens.insert_one({
+        "token": magic_token,
+        "user_id": user["id"],
+        "username": user.get("username", ""),
+        "created_at": datetime.now(timezone.utc),
+        "expires_at": datetime.now(timezone.utc) + timedelta(minutes=5),
+        "used": False,
+    })
+    # Build QR data: URL with magic token
+    qr_url = f"{FRONTEND_URL}/magic-login?token={magic_token}"
+    # Generate QR as base64 PNG
+    qr = qrcode.QRCode(version=1, box_size=8, border=2)
+    qr.add_data(qr_url)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="#2D5A3D", back_color="#080C0A")
+    buf = io.BytesIO()
+    img.save(buf, format='PNG')
+    qr_base64 = base64.b64encode(buf.getvalue()).decode('utf-8')
+    
+    await audit_log("magic_qr_created", user["id"], request.client.host if request.client else "unknown")
+    return {"qr_base64": f"data:image/png;base64,{qr_base64}", "token": magic_token, "expires_in": 300}
+
+@api_router.post("/auth/magic-verify")
+async def verify_magic_token(request: Request, response: Response):
+    """Verify a magic QR token and issue JWT. Called by the scanning device."""
+    body = await request.json()
+    magic_token = body.get("token", "")
+    if not magic_token:
+        raise HTTPException(status_code=400, detail="Kein Magic-Token")
+    
+    doc = await db.magic_tokens.find_one({"token": magic_token, "used": False})
+    if not doc:
+        raise HTTPException(status_code=401, detail="Ungültiger oder abgelaufener Token")
+    
+    expires = doc.get("expires_at")
+    if expires:
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=timezone.utc)
+        if expires < datetime.now(timezone.utc):
+            await db.magic_tokens.delete_one({"token": magic_token})
+            raise HTTPException(status_code=401, detail="Token abgelaufen")
+    
+    # Mark as used
+    await db.magic_tokens.update_one({"token": magic_token}, {"$set": {"used": True}})
+    
+    user_id = doc["user_id"]
+    user = await db.users.find_one({"_id": ObjectId(user_id)})
+    if not user:
+        raise HTTPException(status_code=404, detail="Benutzer nicht gefunden")
+    
+    access_token = create_access_token(user_id)
+    refresh_token = create_refresh_token(user_id)
+    response.set_cookie(key="access_token", value=access_token, httponly=True, secure=False, samesite="lax", max_age=ACCESS_TOKEN_MINUTES*60, path="/")
+    response.set_cookie(key="refresh_token", value=refresh_token, httponly=True, secure=False, samesite="lax", max_age=REFRESH_TOKEN_DAYS*86400, path="/")
+    
+    client_ip = request.client.host if request.client else "unknown"
+    await audit_log("magic_login", user_id, client_ip, {"via": "qr_scan"})
+    return {"user": serialize_user(user), "token": access_token}
+
+# Socket.IO: Notify original device when QR is scanned
+@sio.event
+async def magic_qr_poll(sid, data):
+    """Original device polls to check if QR was scanned"""
+    session = await sio.get_session(sid)
+    if not session:
+        return
+    token = data.get("token")
+    if not token:
+        return
+    doc = await db.magic_tokens.find_one({"token": token, "user_id": session["user_id"]})
+    if doc and doc.get("used"):
+        await sio.emit("magic_qr_verified", {"success": True}, to=sid)
 
 # ==================== STARTUP ====================
 
@@ -836,6 +922,8 @@ async def startup():
     await db.token_blacklist.create_index("token_hash")
     await db.token_blacklist.create_index("expires_at", expireAfterSeconds=0)
     await db.audit_log.create_index("timestamp")
+    await db.magic_tokens.create_index("token")
+    await db.magic_tokens.create_index("expires_at", expireAfterSeconds=0)
     
     # Seed anonymous demo users
     for udata in [

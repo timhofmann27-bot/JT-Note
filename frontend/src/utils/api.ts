@@ -60,6 +60,8 @@ export const authAPI = {
   generateUsername: () => api.get('/auth/generate-username'),
   refresh: () => api.post('/auth/refresh'),
   deleteAccount: () => api.delete('/auth/account'),
+  createMagicQR: () => api.post('/auth/magic-qr'),
+  verifyMagicToken: (token: string) => api.post('/auth/magic-verify', { token }),
 };
 
 export const usersAPI = {

@@ -1,0 +1,84 @@
+# 444.HEIMAT-FUNK — Docker Compose (Self-Hosted / Militär-Ready)
+# Usage: docker compose up -d && curl -f https://yourapp.com/api/health
+
+services:
+  # ==================== APP (FastAPI + Socket.IO) ====================
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    environment:
+      - MONGO_URL=mongodb://mongo:27017
+      - DB_NAME=heimatfunk_db
+      - JWT_SECRET=${JWT_SECRET}
+      - FRONTEND_URL=${FRONTEND_URL:-https://messenger.example.com}
+    depends_on:
+      mongo:
+        condition: service_healthy
+    networks:
+      - internal
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.api.rule=Host(`${DOMAIN:-messenger.example.com}`) && PathPrefix(`/api`)"
+      - "traefik.http.routers.api.tls.certresolver=letsencrypt"
+      - "traefik.http.services.api.loadbalancer.server.port=8001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # ==================== MONGODB ====================
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    volumes:
+      - mongo_data:/data/db
+    networks:
+      - internal
+    command: ["--wiredTigerCacheSizeGB", "0.5", "--quiet"]
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ==================== TRAEFIK (Reverse Proxy + AutoTLS) ====================
+  traefik:
+    image: traefik:v3.0
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - traefik_certs:/certs
+    command:
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      - "--entrypoints.web.http.redirections.entryPoint.to=websecure"
+      - "--certificatesresolvers.letsencrypt.acme.tlschallenge=true"
+      - "--certificatesresolvers.letsencrypt.acme.email=${ACME_EMAIL:-admin@example.com}"
+      - "--certificatesresolvers.letsencrypt.acme.storage=/certs/acme.json"
+      - "--api.dashboard=false"
+      - "--log.level=WARN"
+    networks:
+      - internal
+
+volumes:
+  mongo_data:
+  traefik_certs:
+
+networks:
+  internal:
+    driver: bridge
