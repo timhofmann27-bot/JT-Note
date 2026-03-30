@@ -3,7 +3,7 @@ import { authAPI, setAuthToken } from '../utils/api';
 
 type User = {
   id: string;
-  email: string;
+  username: string;
   name: string;
   callsign: string;
   role: string;
@@ -15,19 +15,15 @@ type User = {
 type AuthContextType = {
   user: User;
   loading: boolean;
-  login: (email: string, password: string) => Promise<void>;
-  register: (email: string, password: string, name: string, callsign?: string) => Promise<void>;
+  login: (username: string, passkey: string) => Promise<void>;
+  register: (username: string, passkey: string, name: string, callsign?: string) => Promise<void>;
   logout: () => Promise<void>;
   refreshUser: () => Promise<void>;
 };
 
 const AuthContext = createContext<AuthContextType>({
-  user: null,
-  loading: true,
-  login: async () => {},
-  register: async () => {},
-  logout: async () => {},
-  refreshUser: async () => {},
+  user: null, loading: true,
+  login: async () => {}, register: async () => {}, logout: async () => {}, refreshUser: async () => {},
 });
 
 export const useAuth = () => useContext(AuthContext);
@@ -37,37 +33,26 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [loading, setLoading] = useState(true);
 
   const refreshUser = useCallback(async () => {
-    try {
-      const res = await authAPI.me();
-      setUser(res.data.user);
-    } catch {
-      setUser(null);
-      setAuthToken(null);
-    }
+    try { const res = await authAPI.me(); setUser(res.data.user); }
+    catch { setUser(null); setAuthToken(null); }
   }, []);
 
   useEffect(() => {
-    const check = async () => {
-      try {
-        const res = await authAPI.me();
-        setUser(res.data.user);
-      } catch {
-        setUser(null);
-      } finally {
-        setLoading(false);
-      }
-    };
-    check();
+    (async () => {
+      try { const res = await authAPI.me(); setUser(res.data.user); }
+      catch { setUser(null); }
+      finally { setLoading(false); }
+    })();
   }, []);
 
-  const login = async (email: string, password: string) => {
-    const res = await authAPI.login({ email, password });
+  const login = async (username: string, passkey: string) => {
+    const res = await authAPI.login({ username, passkey });
     setAuthToken(res.data.token);
     setUser(res.data.user);
   };
 
-  const register = async (email: string, password: string, name: string, callsign?: string) => {
-    const res = await authAPI.register({ email, password, name, callsign });
+  const register = async (username: string, passkey: string, name: string, callsign?: string) => {
+    const res = await authAPI.register({ username, passkey, name, callsign });
     setAuthToken(res.data.token);
     setUser(res.data.user);
   };

@@ -16,8 +16,14 @@ class TestUsers:
         data = response.json()
         assert "users" in data
         assert isinstance(data["users"], list)
-        assert len(data["users"]) >= 1  # At least test user
-        print(f"✓ Found {len(data['users'])} users")
+        assert len(data["users"]) >= 1
+        
+        # Verify no email field in users
+        for user in data["users"]:
+            assert "email" not in user, "Email field should not exist in anonymous auth"
+            assert "username" in user, "Username field missing"
+        
+        print(f"✓ Found {len(data['users'])} users (all without email field)")
 
     def test_get_user_by_id(self, api_client, base_url, admin_token):
         """Test GET /api/users/{id}"""
@@ -38,7 +44,9 @@ class TestUsers:
             data = response.json()
             assert "user" in data
             assert data["user"]["id"] == user_id
-            print(f"✓ User retrieved: {data['user']['name']}")
+            assert "email" not in data["user"], "Email field should not exist"
+            assert "username" in data["user"], "Username field missing"
+            print(f"✓ User retrieved: {data['user']['name']} (@{data['user']['username']})")
         else:
             pytest.skip("No users available for testing")
 

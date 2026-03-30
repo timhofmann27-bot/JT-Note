@@ -7,23 +7,23 @@ import { useAuth } from '../src/context/AuthContext';
 import { COLORS, FONTS, SPACING } from '../src/utils/theme';
 
 export default function LoginScreen() {
-  const [email, setEmail] = useState('');
-  const [password, setPassword] = useState('');
-  const [showPassword, setShowPassword] = useState(false);
+  const [username, setUsername] = useState('');
+  const [passkey, setPasskey] = useState('');
+  const [showPasskey, setShowPasskey] = useState(false);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const { login } = useAuth();
   const router = useRouter();
 
   const handleLogin = async () => {
-    if (!email.trim() || !password.trim()) {
+    if (!username.trim() || !passkey.trim()) {
       setError('Bitte alle Felder ausfüllen');
       return;
     }
     setLoading(true);
     setError('');
     try {
-      await login(email, password);
+      await login(username.trim(), passkey);
       router.replace('/(tabs)/chats');
     } catch (e: any) {
       const detail = e?.response?.data?.detail;
@@ -42,7 +42,12 @@ export default function LoginScreen() {
               <Ionicons name="radio" size={36} color={COLORS.primaryLight} />
             </View>
             <Text style={styles.title}>444.HEIMAT-FUNK</Text>
-            <Text style={styles.subtitle}>SICHERE ANMELDUNG</Text>
+            <Text style={styles.subtitle}>ANONYME ANMELDUNG</Text>
+          </View>
+
+          <View style={styles.anonBadge}>
+            <Ionicons name="eye-off" size={14} color={COLORS.primaryLight} />
+            <Text style={styles.anonText}>Keine E-Mail · Keine Telefonnummer · Keine Identität</Text>
           </View>
 
           <View style={styles.form}>
@@ -53,36 +58,35 @@ export default function LoginScreen() {
               </View>
             ) : null}
 
-            <Text style={styles.label}>KENNUNG (E-MAIL)</Text>
+            <Text style={styles.label}>BENUTZERNAME</Text>
             <View style={styles.inputContainer}>
-              <Ionicons name="mail-outline" size={18} color={COLORS.textMuted} style={styles.inputIcon} />
+              <Ionicons name="at-outline" size={18} color={COLORS.textMuted} style={styles.inputIcon} />
               <TextInput
-                testID="login-email-input"
+                testID="login-username-input"
                 style={styles.input}
-                value={email}
-                onChangeText={setEmail}
-                placeholder="kennung@heimatfunk.de"
+                value={username}
+                onChangeText={setUsername}
+                placeholder="z.B. wolf-1"
                 placeholderTextColor={COLORS.textMuted}
-                keyboardType="email-address"
                 autoCapitalize="none"
                 autoCorrect={false}
               />
             </View>
 
-            <Text style={styles.label}>PASSWORT</Text>
+            <Text style={styles.label}>PASSKEY</Text>
             <View style={styles.inputContainer}>
-              <Ionicons name="lock-closed-outline" size={18} color={COLORS.textMuted} style={styles.inputIcon} />
+              <Ionicons name="key-outline" size={18} color={COLORS.textMuted} style={styles.inputIcon} />
               <TextInput
-                testID="login-password-input"
+                testID="login-passkey-input"
                 style={styles.input}
-                value={password}
-                onChangeText={setPassword}
-                placeholder="Passwort eingeben"
+                value={passkey}
+                onChangeText={setPasskey}
+                placeholder="Dein geheimer Passkey"
                 placeholderTextColor={COLORS.textMuted}
-                secureTextEntry={!showPassword}
+                secureTextEntry={!showPasskey}
               />
-              <TouchableOpacity testID="toggle-password" onPress={() => setShowPassword(!showPassword)} style={styles.eyeBtn}>
-                <Ionicons name={showPassword ? 'eye-off' : 'eye'} size={20} color={COLORS.textMuted} />
+              <TouchableOpacity testID="toggle-passkey" onPress={() => setShowPasskey(!showPasskey)} style={styles.eyeBtn}>
+                <Ionicons name={showPasskey ? 'eye-off' : 'eye'} size={20} color={COLORS.textMuted} />
               </TouchableOpacity>
             </View>
 
@@ -99,13 +103,13 @@ export default function LoginScreen() {
 
             <View style={styles.securityBadge}>
               <Ionicons name="shield-checkmark" size={14} color={COLORS.primaryLight} />
-              <Text style={styles.securityText}>Ende-zu-Ende verschlüsselt</Text>
+              <Text style={styles.securityText}>Ende-zu-Ende verschlüsselt · DSGVO-konform</Text>
             </View>
           </View>
 
           <TouchableOpacity testID="go-to-register" onPress={() => router.push('/register')} style={styles.registerLink}>
             <Text style={styles.registerText}>Noch kein Zugang? </Text>
-            <Text style={styles.registerTextBold}>Registrieren</Text>
+            <Text style={styles.registerTextBold}>Anonym registrieren</Text>
           </TouchableOpacity>
         </ScrollView>
       </KeyboardAvoidingView>
@@ -117,7 +121,7 @@ const styles = StyleSheet.create({
   safe: { flex: 1, backgroundColor: COLORS.background },
   flex: { flex: 1 },
   scroll: { flexGrow: 1, justifyContent: 'center', padding: SPACING.xl },
-  header: { alignItems: 'center', marginBottom: 40 },
+  header: { alignItems: 'center', marginBottom: 16 },
   iconCircle: {
     width: 72, height: 72, borderRadius: 36,
     backgroundColor: COLORS.primaryDark, alignItems: 'center', justifyContent: 'center',
@@ -125,6 +129,12 @@ const styles = StyleSheet.create({
   },
   title: { fontSize: FONTS.sizes.xxl, fontWeight: FONTS.weights.bold, color: COLORS.textPrimary, letterSpacing: 2 },
   subtitle: { fontSize: FONTS.sizes.xs, fontWeight: FONTS.weights.medium, color: COLORS.primaryLight, letterSpacing: 3, marginTop: 6 },
+  anonBadge: {
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6,
+    backgroundColor: COLORS.primaryDark, borderRadius: 8, padding: 10, marginBottom: 24,
+    borderWidth: 1, borderColor: COLORS.primary,
+  },
+  anonText: { fontSize: FONTS.sizes.xs, color: COLORS.primaryLight, fontWeight: FONTS.weights.medium },
   form: { gap: 4 },
   label: { fontSize: FONTS.sizes.xs, fontWeight: FONTS.weights.semibold, color: COLORS.textSecondary, letterSpacing: 2, marginTop: 16, marginBottom: 6 },
   inputContainer: {
@@ -141,7 +151,7 @@ const styles = StyleSheet.create({
   },
   loginBtnText: { fontSize: FONTS.sizes.base, fontWeight: FONTS.weights.bold, color: COLORS.white, letterSpacing: 1 },
   securityBadge: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6, marginTop: 16 },
-  securityText: { fontSize: FONTS.sizes.sm, color: COLORS.primaryLight },
+  securityText: { fontSize: FONTS.sizes.xs, color: COLORS.primaryLight },
   registerLink: { flexDirection: 'row', justifyContent: 'center', marginTop: 32 },
   registerText: { fontSize: FONTS.sizes.md, color: COLORS.textSecondary },
   registerTextBold: { fontSize: FONTS.sizes.md, color: COLORS.primaryLight, fontWeight: FONTS.weights.semibold },

@@ -1,5 +1,4 @@
 import axios from 'axios';
-import { Platform } from 'react-native';
 
 const BACKEND_URL = process.env.EXPO_PUBLIC_BACKEND_URL || '';
 
@@ -22,28 +21,27 @@ export const setAuthToken = (token: string | null) => {
 
 export const getAuthToken = () => authToken;
 
-// Auth
+// Auth (Anonymous: Username + Passkey)
 export const authAPI = {
-  register: (data: { email: string; password: string; name: string; callsign?: string }) =>
+  register: (data: { username: string; passkey: string; name: string; callsign?: string }) =>
     api.post('/auth/register', data),
-  login: (data: { email: string; password: string }) =>
+  login: (data: { username: string; passkey: string }) =>
     api.post('/auth/login', data),
   me: () => api.get('/auth/me'),
   logout: () => api.post('/auth/logout'),
+  changePasskey: (data: { old_passkey: string; new_passkey: string }) =>
+    api.post('/auth/change-passkey', data),
 };
 
-// Users
 export const usersAPI = {
   list: () => api.get('/users'),
   get: (id: string) => api.get(`/users/${id}`),
 };
 
-// Profile
 export const profileAPI = {
   update: (data: any) => api.put('/profile', data),
 };
 
-// Contacts
 export const contactsAPI = {
   list: () => api.get('/contacts'),
   add: (userId: string, trustLevel?: string) =>
@@ -51,23 +49,22 @@ export const contactsAPI = {
   remove: (contactId: string) => api.delete(`/contacts/${contactId}`),
 };
 
-// Chats
 export const chatsAPI = {
   list: () => api.get('/chats'),
   create: (data: any) => api.post('/chats', data),
   get: (id: string) => api.get(`/chats/${id}`),
   pollUpdates: () => api.get('/chats/poll/updates'),
+  leave: (id: string) => api.post(`/chats/${id}/leave`),
 };
 
-// Messages
 export const messagesAPI = {
   list: (chatId: string, limit?: number) => api.get(`/messages/${chatId}`, { params: { limit } }),
   send: (data: any) => api.post('/messages', data),
   markRead: (messageIds: string[]) => api.post('/messages/read', { message_ids: messageIds }),
   poll: (chatId: string, after?: string) => api.get(`/messages/poll/${chatId}`, { params: { after } }),
+  delete: (id: string) => api.delete(`/messages/${id}`),
 };
 
-// Typing
 export const typingAPI = {
   set: (chatId: string) => api.post(`/typing/${chatId}`),
   get: (chatId: string) => api.get(`/typing/${chatId}`),

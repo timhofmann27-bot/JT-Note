@@ -12,10 +12,8 @@ def api_client():
 @pytest.fixture
 def base_url():
     """Base URL from environment"""
-    # Read from frontend .env since tests run from backend
     url = os.environ.get('EXPO_PUBLIC_BACKEND_URL')
     if not url:
-        # Fallback: read from frontend .env file
         try:
             with open('/app/frontend/.env', 'r') as f:
                 for line in f:
@@ -30,18 +28,18 @@ def base_url():
 
 @pytest.fixture
 def admin_credentials():
-    """Admin login credentials"""
+    """Admin login credentials (ANONYMOUS AUTH)"""
     return {
-        "email": "kommandant@heimatfunk.de",
-        "password": "Funk2024!"
+        "username": "wolf-1",
+        "passkey": "Funk2024!"
     }
 
 @pytest.fixture
 def test_user_credentials():
-    """Test user login credentials"""
+    """Test user login credentials (ANONYMOUS AUTH)"""
     return {
-        "email": "funker@heimatfunk.de",
-        "password": "Funk2024!"
+        "username": "adler-2",
+        "passkey": "Funk2024!"
     }
 
 @pytest.fixture

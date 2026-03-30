@@ -116,8 +116,8 @@ export default function SettingsScreen() {
           </View>
           <View style={styles.fieldDivider} />
           <View style={styles.fieldRow}>
-            <Text style={styles.fieldLabel}>E-Mail</Text>
-            <Text style={styles.fieldValue}>{user?.email}</Text>
+            <Text style={styles.fieldLabel}>Username</Text>
+            <Text style={styles.fieldValue}>@{user?.username}</Text>
           </View>
         </View>
       </View>
