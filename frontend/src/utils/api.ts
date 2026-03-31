@@ -75,9 +75,13 @@ export const profileAPI = {
 
 export const contactsAPI = {
   list: () => api.get('/contacts'),
-  add: (userId: string, trustLevel?: string) =>
-    api.post('/contacts/add', { user_id: userId, trust_level: trustLevel || 'UNVERIFIED' }),
+  requests: () => api.get('/contacts/requests'),
+  addByCode: (code: string) => api.post('/contacts/add-by-code', { code }),
+  acceptRequest: (id: string) => api.post(`/contacts/request/${id}/accept`),
+  rejectRequest: (id: string) => api.post(`/contacts/request/${id}/reject`),
   remove: (contactId: string) => api.delete(`/contacts/${contactId}`),
+  getMyCode: () => api.get('/users/my-add-code'),
+  resetCode: () => api.post('/users/reset-add-code'),
 };
 
 export const chatsAPI = {

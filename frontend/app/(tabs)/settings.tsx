@@ -3,7 +3,7 @@ import { View, Text, TouchableOpacity, StyleSheet, ScrollView, TextInput, Alert,
 import { useRouter } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
 import { useAuth } from '../../src/context/AuthContext';
-import { profileAPI, authAPI } from '../../src/utils/api';
+import { profileAPI, authAPI, contactsAPI } from '../../src/utils/api';
 import { COLORS, FONTS, SPACING, ROLES } from '../../src/utils/theme';
 
 export default function SettingsScreen() {
@@ -20,6 +20,8 @@ export default function SettingsScreen() {
   const [deleting, setDeleting] = useState(false);
   const [qrData, setQrData] = useState<string | null>(null);
   const [qrLoading, setQrLoading] = useState(false);
+  const [addCode, setAddCode] = useState('');
+  const [codeLoading, setCodeLoading] = useState(false);
 
   const handleSave = async () => {
     try {
@@ -73,6 +75,18 @@ export default function SettingsScreen() {
       setQrLoading(false);
     }
   };
+
+  const loadAddCode = async () => {
+    try { const res = await contactsAPI.getMyCode(); setAddCode(res.data.code); } catch {}
+  };
+  const handleResetCode = async () => {
+    setCodeLoading(true);
+    try { const res = await contactsAPI.resetCode(); setAddCode(res.data.code); }
+    catch (e: any) { console.log('Reset error', e?.response?.data?.detail); }
+    finally { setCodeLoading(false); }
+  };
+  React.useEffect(() => { loadAddCode(); }, []);
+
 
   const roleInfo = ROLES[(user?.role || 'soldier') as keyof typeof ROLES] || ROLES.soldier;
 
@@ -164,6 +178,25 @@ export default function SettingsScreen() {
             <Text style={styles.fieldLabel}>Username</Text>
             <Text style={styles.fieldValue}>@{user?.username}</Text>
           </View>
+        </View>
+      </View>
+
+      {/* Add-Me Code */}
+      <View style={styles.section}>
+        <Text style={styles.sectionTitle}>MEIN ADD-CODE</Text>
+        <View style={styles.fieldCard}>
+          <View style={styles.codeRow}>
+            <Ionicons name="key" size={20} color={COLORS.primaryLight} />
+            <Text testID="my-add-code" style={styles.addCodeText}>{addCode || '...'}</Text>
+          </View>
+          <Text style={styles.codeHintText}>Teile diesen Code mit anderen Nutzern, damit sie dich als Kontakt hinzufügen können.</Text>
+          <View style={styles.fieldDivider} />
+          <TouchableOpacity testID="reset-code-btn" style={styles.resetCodeBtn} onPress={handleResetCode} disabled={codeLoading}>
+            {codeLoading ? <ActivityIndicator size="small" color={COLORS.restricted} /> : (
+              <><Ionicons name="refresh" size={14} color={COLORS.restricted} /><Text style={styles.resetCodeText}>Code zurücksetzen</Text></>
+            )}
+          </TouchableOpacity>
+          <Text style={styles.resetWarn}>Alter Code wird sofort ungültig. Max 3 Resets/Tag.</Text>
         </View>
       </View>
 
@@ -288,6 +321,12 @@ const styles = StyleSheet.create({
   qrTimer: { fontSize: FONTS.sizes.xs, color: COLORS.restricted, fontWeight: FONTS.weights.bold, marginTop: 6 },
   qrBtn: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, paddingVertical: 14 },
   qrBtnText: { fontSize: FONTS.sizes.sm, fontWeight: FONTS.weights.semibold, color: COLORS.primaryLight },
+  codeRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 10, paddingVertical: 12 },
+  addCodeText: { fontSize: 22, fontWeight: '800', color: COLORS.primaryLight, letterSpacing: 4, fontFamily: 'monospace' },
+  codeHintText: { fontSize: FONTS.sizes.xs, color: COLORS.textMuted, textAlign: 'center', paddingHorizontal: 12, lineHeight: 16 },
+  resetCodeBtn: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6, paddingVertical: 10 },
+  resetCodeText: { fontSize: FONTS.sizes.sm, fontWeight: FONTS.weights.semibold, color: COLORS.restricted },
+  resetWarn: { fontSize: 10, color: COLORS.textMuted, textAlign: 'center' },
   versionInfo: { alignItems: 'center', marginTop: 32, paddingBottom: 20 },
   versionText: { fontSize: FONTS.sizes.sm, color: COLORS.textMuted },
   versionSub: { fontSize: FONTS.sizes.xs, color: COLORS.textMuted, marginTop: 2 },

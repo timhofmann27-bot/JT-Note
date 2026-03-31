@@ -394,6 +394,8 @@ async def register(input: RegisterInput, request: Request, response: Response):
         "status_text": "Bereit",
         "avatar_base64": None,
         "trust_level": "VERIFIED",
+        "add_me_code": generate_add_code(),
+        "add_me_code_updated_at": datetime.now(timezone.utc),
         "contacts": [],
         "blocked_users": [],
         "created_at": datetime.now(timezone.utc),
@@ -509,6 +511,14 @@ async def change_passkey(input: PasskeyChange, request: Request, user: dict = De
     await audit_log("passkey_change", user["id"], request.client.host if request.client else "unknown")
     return {"message": "Passkey geändert"}
 
+# ==================== ADD-ME CODE GENERATOR ====================
+
+def generate_add_code() -> str:
+    """Generate FUNK-XXXXXX code (6 alphanumeric, uppercase)"""
+    chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # No I/O/0/1 for readability
+    code = ''.join(random.choice(chars) for _ in range(6))
+    return f"FUNK-{code}"
+
 # ==================== USER / PROFILE ====================
 
 @api_router.put("/profile")
@@ -523,52 +533,205 @@ async def update_profile(input: ProfileUpdate, user: dict = Depends(get_current_
     updated = await db.users.find_one({"_id": ObjectId(user["id"])}, {"password_hash": 0})
     return {"user": serialize_user(updated)}
 
+@api_router.get("/users/my-add-code")
+async def get_my_add_code(user: dict = Depends(get_current_user)):
+    """Get current user's Add-Me code"""
+    u = await db.users.find_one({"_id": ObjectId(user["id"])})
+    code = u.get("add_me_code")
+    if not code:
+        code = generate_add_code()
+        await db.users.update_one({"_id": ObjectId(user["id"])}, {"$set": {"add_me_code": code, "add_me_code_updated_at": datetime.now(timezone.utc)}})
+    return {"code": code}
+
+@api_router.post("/users/reset-add-code")
+async def reset_add_code(request: Request, user: dict = Depends(get_current_user)):
+    """Reset Add-Me code — old code becomes instantly invalid"""
+    client_ip = request.client.host if request.client else "unknown"
+    # Rate limit: 3 resets/day
+    today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    reset_count = await db.audit_log.count_documents({"action": "add_code_reset", "user_id": user["id"], "timestamp": {"$gte": today_start}})
+    if reset_count >= 3:
+        raise HTTPException(status_code=429, detail="Maximal 3 Code-Resets pro Tag")
+    new_code = generate_add_code()
+    await db.users.update_one({"_id": ObjectId(user["id"])}, {"$set": {"add_me_code": new_code, "add_me_code_updated_at": datetime.now(timezone.utc)}})
+    await audit_log("add_code_reset", user["id"], client_ip)
+    return {"code": new_code}
+
+# PRIVACY: Remove global user listing — only confirmed contacts visible
 @api_router.get("/users")
 async def list_users(user: dict = Depends(get_current_user)):
-    users = await db.users.find({"_id": {"$ne": ObjectId(user["id"])}}, {"password_hash": 0, "contacts": 0, "blocked_users": 0}).to_list(500)
-    return {"users": [serialize_user_public(u) for u in users]}
+    """Returns ONLY confirmed contacts (no global user list)"""
+    confirmed = await db.contacts.find({"owner_id": user["id"], "status": "confirmed"}).to_list(500)
+    result = []
+    for c in confirmed:
+        u = await db.users.find_one({"_id": ObjectId(c["contact_id"])}, {"password_hash": 0, "contacts": 0, "blocked_users": 0, "add_me_code": 0})
+        if u:
+            result.append(serialize_user_public(u))
+    return {"users": result}
 
 @api_router.get("/users/{user_id}")
 async def get_user(user_id: str, user: dict = Depends(get_current_user)):
-    u = await db.users.find_one({"_id": ObjectId(user_id)}, {"password_hash": 0, "contacts": 0, "blocked_users": 0})
+    # Only allow viewing confirmed contacts
+    is_contact = await db.contacts.find_one({"owner_id": user["id"], "contact_id": user_id, "status": "confirmed"})
+    if not is_contact:
+        raise HTTPException(status_code=403, detail="Nur bestätigte Kontakte können angesehen werden")
+    u = await db.users.find_one({"_id": ObjectId(user_id)}, {"password_hash": 0, "contacts": 0, "blocked_users": 0, "add_me_code": 0})
     if not u:
         raise HTTPException(status_code=404, detail="Benutzer nicht gefunden")
     return {"user": serialize_user_public(u)}
 
-# ==================== CONTACTS ====================
+# ==================== CONTACTS (Add-Me-Code System) ====================
 
-@api_router.post("/contacts/add")
-async def add_contact(input: ContactAdd, user: dict = Depends(get_current_user)):
-    if input.user_id == user["id"]:
-        raise HTTPException(status_code=400, detail="Kann sich nicht selbst als Kontakt hinzufügen")
-    target = await db.users.find_one({"_id": ObjectId(input.user_id)})
+class AddByCodeInput(BaseModel):
+    code: str = Field(min_length=6, max_length=12)
+
+@api_router.post("/contacts/add-by-code")
+async def add_by_code(input: AddByCodeInput, request: Request, user: dict = Depends(get_current_user)):
+    """Send contact request via Add-Me code"""
+    code = input.code.strip().upper()
+    client_ip = request.client.host if request.client else "unknown"
+    
+    # Rate limit: 5 code attempts/min
+    rl_key = f"addcode:{anonymize_ip(client_ip)}"
+    rl = await db.login_attempts.find_one_and_update(
+        {"identifier": rl_key},
+        {"$inc": {"count": 1}, "$set": {"last_attempt": datetime.now(timezone.utc)}, "$setOnInsert": {"locked_until": None}},
+        upsert=True, return_document=True
+    )
+    if rl and rl.get("count", 0) > 5:
+        last = rl.get("last_attempt")
+        if last:
+            if last.tzinfo is None: last = last.replace(tzinfo=timezone.utc)
+            if (datetime.now(timezone.utc) - last).total_seconds() < 60:
+                raise HTTPException(status_code=429, detail="Zu viele Versuche. Bitte warte 1 Minute.")
+            else:
+                await db.login_attempts.delete_one({"identifier": rl_key})
+    
+    target = await db.users.find_one({"add_me_code": code})
     if not target:
-        raise HTTPException(status_code=404, detail="Benutzer nicht gefunden")
-    existing = await db.contacts.find_one({"owner_id": user["id"], "contact_id": input.user_id})
-    if existing:
-        raise HTTPException(status_code=400, detail="Kontakt bereits vorhanden")
-    await db.contacts.insert_one({"owner_id": user["id"], "contact_id": input.user_id, "trust_level": input.trust_level, "added_at": datetime.now(timezone.utc)})
-    reverse = await db.contacts.find_one({"owner_id": input.user_id, "contact_id": user["id"]})
-    if not reverse:
-        await db.contacts.insert_one({"owner_id": input.user_id, "contact_id": user["id"], "trust_level": "UNVERIFIED", "added_at": datetime.now(timezone.utc)})
-    return {"message": "Kontakt hinzugefügt"}
+        raise HTTPException(status_code=404, detail="Ungültiger Code")
+    
+    target_id = str(target["_id"])
+    if target_id == user["id"]:
+        raise HTTPException(status_code=400, detail="Das ist dein eigener Code")
+    
+    # Check if already contacts
+    existing_contact = await db.contacts.find_one({"owner_id": user["id"], "contact_id": target_id, "status": "confirmed"})
+    if existing_contact:
+        raise HTTPException(status_code=400, detail="Bereits in deinen Kontakten")
+    
+    # Check if request already exists
+    existing_req = await db.contact_requests.find_one({
+        "$or": [
+            {"requester_id": user["id"], "target_id": target_id, "status": "pending"},
+            {"requester_id": target_id, "target_id": user["id"], "status": "pending"},
+        ]
+    })
+    if existing_req:
+        raise HTTPException(status_code=400, detail="Anfrage bereits gesendet")
+    
+    req_doc = {
+        "requester_id": user["id"],
+        "requester_username": user.get("username", ""),
+        "requester_name": user.get("name", ""),
+        "requester_callsign": user.get("callsign", ""),
+        "target_id": target_id,
+        "status": "pending",
+        "created_at": datetime.now(timezone.utc),
+    }
+    result = await db.contact_requests.insert_one(req_doc)
+    
+    # WebSocket: Notify target user
+    await ws_emit_to_user(target_id, "contact:request:new", {
+        "request_id": str(result.inserted_id),
+        "from_username": user.get("username", ""),
+        "from_name": user.get("name", ""),
+    })
+    
+    await audit_log("contact_request_sent", user["id"], client_ip, {"target_id": target_id})
+    return {"message": "Anfrage gesendet!", "request_id": str(result.inserted_id)}
+
+@api_router.get("/contacts/requests")
+async def get_contact_requests(user: dict = Depends(get_current_user)):
+    """Get incoming and outgoing contact requests"""
+    incoming = await db.contact_requests.find({"target_id": user["id"], "status": "pending"}).to_list(100)
+    outgoing = await db.contact_requests.find({"requester_id": user["id"], "status": "pending"}).to_list(100)
+    
+    def serialize_req(r):
+        return {
+            "id": str(r["_id"]),
+            "requester_id": r["requester_id"],
+            "requester_username": r.get("requester_username", ""),
+            "requester_name": r.get("requester_name", ""),
+            "requester_callsign": r.get("requester_callsign", ""),
+            "target_id": r["target_id"],
+            "status": r["status"],
+            "created_at": r["created_at"].isoformat() if isinstance(r["created_at"], datetime) else r["created_at"],
+        }
+    
+    return {"incoming": [serialize_req(r) for r in incoming], "outgoing": [serialize_req(r) for r in outgoing]}
+
+@api_router.post("/contacts/request/{request_id}/accept")
+async def accept_contact_request(request_id: str, request: Request, user: dict = Depends(get_current_user)):
+    oid = validate_object_id(request_id)
+    req = await db.contact_requests.find_one({"_id": oid, "target_id": user["id"], "status": "pending"})
+    if not req:
+        raise HTTPException(status_code=404, detail="Anfrage nicht gefunden")
+    
+    # Create bidirectional confirmed contacts
+    now = datetime.now(timezone.utc)
+    requester_id = req["requester_id"]
+    
+    # Upsert both directions
+    for a, b in [(user["id"], requester_id), (requester_id, user["id"])]:
+        await db.contacts.update_one(
+            {"owner_id": a, "contact_id": b},
+            {"$set": {"owner_id": a, "contact_id": b, "status": "confirmed", "confirmed_at": now}},
+            upsert=True
+        )
+    
+    await db.contact_requests.update_one({"_id": oid}, {"$set": {"status": "accepted"}})
+    
+    # WebSocket: Notify requester
+    await ws_emit_to_user(requester_id, "contact:request:accepted", {
+        "request_id": request_id,
+        "by_username": user.get("username", ""),
+    })
+    
+    client_ip = request.client.host if request.client else "unknown"
+    await audit_log("contact_accepted", user["id"], client_ip, {"requester_id": requester_id})
+    return {"message": "Kontakt bestätigt!"}
+
+@api_router.post("/contacts/request/{request_id}/reject")
+async def reject_contact_request(request_id: str, request: Request, user: dict = Depends(get_current_user)):
+    oid = validate_object_id(request_id)
+    req = await db.contact_requests.find_one({"_id": oid, "target_id": user["id"], "status": "pending"})
+    if not req:
+        raise HTTPException(status_code=404, detail="Anfrage nicht gefunden")
+    await db.contact_requests.update_one({"_id": oid}, {"$set": {"status": "rejected"}})
+    return {"message": "Anfrage abgelehnt"}
 
 @api_router.get("/contacts")
 async def get_contacts(user: dict = Depends(get_current_user)):
-    contacts = await db.contacts.find({"owner_id": user["id"]}).to_list(500)
+    """Only return CONFIRMED contacts"""
+    contacts = await db.contacts.find({"owner_id": user["id"], "status": "confirmed"}).to_list(500)
     result = []
     for c in contacts:
-        u = await db.users.find_one({"_id": ObjectId(c["contact_id"])}, {"password_hash": 0})
+        u = await db.users.find_one({"_id": ObjectId(c["contact_id"])}, {"password_hash": 0, "add_me_code": 0})
         if u:
-            user_data = serialize_user(u)
-            user_data["trust_level"] = c.get("trust_level", "UNVERIFIED")
+            user_data = serialize_user_public(u)
+            user_data["trust_level"] = "VERIFIED"
             result.append(user_data)
     return {"contacts": result}
 
 @api_router.delete("/contacts/{contact_id}")
-async def remove_contact(contact_id: str, user: dict = Depends(get_current_user)):
+async def remove_contact(contact_id: str, request: Request, user: dict = Depends(get_current_user)):
     await db.contacts.delete_one({"owner_id": user["id"], "contact_id": contact_id})
     await db.contacts.delete_one({"owner_id": contact_id, "contact_id": user["id"]})
+    # WebSocket: Notify other user
+    await ws_emit_to_user(contact_id, "contact:removed", {"by_user_id": user["id"]})
+    client_ip = request.client.host if request.client else "unknown"
+    await audit_log("contact_removed", user["id"], client_ip, {"contact_id": contact_id})
     return {"message": "Kontakt entfernt"}
 
 # ==================== CHATS ====================
@@ -912,7 +1075,10 @@ async def magic_qr_poll(sid, data):
 @app.on_event("startup")
 async def startup():
     await db.users.create_index("username", unique=True)
+    await db.users.create_index("add_me_code", unique=True, sparse=True)
     await db.contacts.create_index([("owner_id", 1), ("contact_id", 1)], unique=True)
+    await db.contact_requests.create_index([("requester_id", 1), ("target_id", 1)])
+    await db.contact_requests.create_index("target_id")
     await db.chats.create_index("participant_ids")
     await db.messages.create_index([("chat_id", 1), ("created_at", -1)])
     await db.messages.create_index("self_destruct_at", expireAfterSeconds=0)
@@ -927,8 +1093,8 @@ async def startup():
     
     # Seed anonymous demo users
     for udata in [
-        {"username": "wolf-1", "password": "Funk2024!", "name": "Kommandant Wolf", "callsign": "WOLF-1", "role": "commander"},
-        {"username": "adler-2", "password": "Funk2024!", "name": "Funker Adler", "callsign": "ADLER-2", "role": "officer"},
+        {"username": "wolf-1", "password": "Funk2024!", "name": "Kommandant Wolf", "callsign": "WOLF-1", "role": "commander", "add_me_code": "FUNK-W0LF01"},
+        {"username": "adler-2", "password": "Funk2024!", "name": "Funker Adler", "callsign": "ADLER-2", "role": "officer", "add_me_code": "FUNK-ADL3R2"},
     ]:
         existing = await db.users.find_one({"username": udata["username"]})
         if not existing:
@@ -938,6 +1104,8 @@ async def startup():
                 "name": udata["name"],
                 "callsign": udata["callsign"],
                 "role": udata["role"],
+                "add_me_code": udata.get("add_me_code", generate_add_code()),
+                "add_me_code_updated_at": datetime.now(timezone.utc),
                 "status": "online",
                 "status_text": "Einsatzbereit",
                 "avatar_base64": None,
