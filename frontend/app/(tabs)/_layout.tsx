@@ -31,8 +31,8 @@ export default function TabLayout() {
           title: 'FUNK',
           headerTitle: () => (
             <View style={styles.headerTitle}>
-              <Ionicons name="radio" size={20} color={COLORS.primaryLight} />
-              <Text style={styles.headerTitleText}>444.HEIMAT-FUNK</Text>
+              <Ionicons name="document-text" size={20} color={COLORS.primaryLight} />
+              <Text style={styles.headerTitleText}>SS-Note</Text>
             </View>
           ),
           tabBarIcon: ({ color, size }) => <Ionicons name="chatbubbles" size={size} color={color} />,

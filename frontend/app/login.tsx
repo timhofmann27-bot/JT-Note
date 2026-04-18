@@ -39,9 +39,9 @@ export default function LoginScreen() {
         <ScrollView contentContainerStyle={styles.scroll} keyboardShouldPersistTaps="handled">
           <View style={styles.header}>
             <View style={styles.iconCircle}>
-              <Ionicons name="radio" size={36} color={COLORS.primaryLight} />
+              <Ionicons name="document-text" size={36} color={COLORS.primaryLight} />
             </View>
-            <Text style={styles.title}>444.HEIMAT-FUNK</Text>
+            <Text style={styles.title}>SS-Note</Text>
             <Text style={styles.subtitle}>ANONYME ANMELDUNG</Text>
           </View>
 

@@ -23,10 +23,10 @@ export default function Index() {
     <View style={styles.container}>
       <View style={styles.logoContainer}>
         <View style={styles.iconCircle}>
-          <Ionicons name="radio" size={48} color={COLORS.primaryLight} />
+          <Ionicons name="document-text" size={48} color={COLORS.primaryLight} />
         </View>
-        <Text style={styles.title}>444.HEIMAT-FUNK</Text>
-        <Text style={styles.subtitle}>VERSCHLÜSSELTE KOMMUNIKATION</Text>
+        <Text style={styles.title}>SS-Note</Text>
+        <Text style={styles.subtitle}>SICHERE KOMMUNIKATION</Text>
         <View style={styles.divider} />
         <Text style={styles.tagline}>Sicher. Souverän. Zuverlässig.</Text>
       </View>

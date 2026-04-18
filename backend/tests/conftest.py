@@ -2,16 +2,8 @@ import pytest
 import requests
 import os
 
-@pytest.fixture
-def api_client():
-    """Shared requests session"""
-    session = requests.Session()
-    session.headers.update({"Content-Type": "application/json"})
-    return session
-
-@pytest.fixture
-def base_url():
-    """Base URL from environment"""
+def get_backend_url():
+    """Get backend URL from environment or .env files"""
     url = os.environ.get('EXPO_PUBLIC_BACKEND_URL')
     if not url:
         try:
@@ -23,7 +15,32 @@ def base_url():
         except:
             pass
     if not url:
-        raise ValueError("EXPO_PUBLIC_BACKEND_URL not found in environment or /app/frontend/.env")
+        try:
+            backend_dir = os.path.dirname(os.path.abspath(__file__))
+            project_root = os.path.dirname(backend_dir)
+            env_path = os.path.join(project_root, 'frontend', '.env')
+            with open(env_path, 'r') as f:
+                for line in f:
+                    if line.startswith('EXPO_PUBLIC_BACKEND_URL='):
+                        url = line.split('=', 1)[1].strip()
+                        break
+        except:
+            pass
+    return url
+
+@pytest.fixture
+def api_client():
+    """Shared requests session"""
+    session = requests.Session()
+    session.headers.update({"Content-Type": "application/json"})
+    return session
+
+@pytest.fixture
+def base_url():
+    """Base URL from environment"""
+    url = get_backend_url()
+    if not url:
+        pytest.skip("EXPO_PUBLIC_BACKEND_URL not configured - skipping integration tests")
     return url.rstrip('/')
 
 @pytest.fixture

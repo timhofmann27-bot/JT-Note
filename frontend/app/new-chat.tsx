@@ -76,7 +76,7 @@ export default function NewChatScreen() {
         <TouchableOpacity testID="new-chat-back-btn" onPress={() => router.back()} style={styles.backBtn}>
           <Ionicons name="chevron-back" size={24} color={COLORS.textPrimary} />
         </TouchableOpacity>
-        <Text style={styles.headerTitle}>{isGroup ? 'NEUE GRUPPE' : 'NEUER KANAL'}</Text>
+        <Text style={styles.headerTitle}>{isGroup ? 'NEUE GRUPPE' : 'NEUER CHAT'}</Text>
         <View style={{ width: 40 }} />
       </View>
 

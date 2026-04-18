@@ -260,7 +260,7 @@ export default function SettingsScreen() {
       </View>
 
       <View style={styles.versionInfo}>
-        <Text style={styles.versionText}>444.HEIMAT-FUNK v2.0.0</Text>
+        <Text style={styles.versionText}>SS-Note v2.0.0</Text>
         <Text style={styles.versionSub}>DSGVO-konform | Zero-PII | BSI-Standard</Text>
       </View>
     </ScrollView>

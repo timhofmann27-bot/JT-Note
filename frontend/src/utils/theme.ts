@@ -1,43 +1,43 @@
-// 444.HEIMAT-FUNK Theme
+// SS-Note Theme - Dark Orange Variant
 export const COLORS = {
-  // Core
-  background: '#080C0A',
-  surface: '#111916',
-  surfaceLight: '#1A2420',
-  surfaceHighlight: '#223029',
+  // Core - Dark background tones
+  background: '#0A0A0A',
+  surface: '#121212',
+  surfaceLight: '#1E1E1E',
+  surfaceHighlight: '#2A2A2A',
   
-  // Accent
-  primary: '#2D5A3D',
-  primaryLight: '#3A7A52',
-  primaryDark: '#1E3D2A',
+  // Accent - Dark Orange tones
+  primary: '#FF8C00',      // Dark Orange
+  primaryLight: '#FF9F1A',  // Lighter Orange
+  primaryDark: '#E67300',   // Darker Orange
   
   // Text
-  textPrimary: '#E8EDE9',
-  textSecondary: '#8A9B8F',
-  textMuted: '#5A6B5F',
+  textPrimary: '#FFFFFF',
+  textSecondary: '#B0B0B0',
+  textMuted: '#808080',
   
   // Status
-  online: '#4ADE80',
-  offline: '#6B7280',
-  away: '#FBBF24',
+  online: '#4CAF50',
+  offline: '#606060',
+  away: '#FFC107',
   
   // Security Levels
-  unclassified: '#6B8F71',
-  restricted: '#D4A843',
-  confidential: '#E67E22',
-  secret: '#C44B4B',
+  unclassified: '#4CAF50',
+  restricted: '#FF9800',
+  confidential: '#FF5722',
+  secret: '#F44336',
   
   // Message
-  sentBubble: '#1E3D2A',
-  receivedBubble: '#1A2420',
-  emergency: '#7F1D1D',
+  sentBubble: '#E67300',
+  receivedBubble: '#1E1E1E',
+  emergency: '#F44336',
   
   // Misc
-  border: '#1F2D25',
-  divider: '#162019',
-  inputBg: '#111916',
-  danger: '#C44B4B',
-  success: '#4ADE80',
+  border: '#2A2A2A',
+  divider: '#1E1E1E',
+  inputBg: '#121212',
+  danger: '#F44336',
+  success: '#4CAF50',
   white: '#FFFFFF',
 };
 
@@ -82,3 +82,4 @@ export const ROLES = {
   officer: { label: 'Offizier', icon: 'shield', color: COLORS.primaryLight },
   soldier: { label: 'Soldat', icon: 'person', color: COLORS.textSecondary },
 };
+

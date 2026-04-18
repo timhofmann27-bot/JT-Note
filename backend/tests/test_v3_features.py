@@ -241,8 +241,8 @@ class TestV3Features:
         service_name = data["service"]
         print(f"Service name: {service_name}")
         
-        # Verify it's HEIMAT-FUNK
-        assert "HEIMAT-FUNK" in service_name or "444" in service_name
+        # Verify it's SS-Note
+        assert "SS-Note" in service_name or "ss-note" in service_name.lower()
         print("✓ Service name correct")
         
         # Note: App icon is in frontend app.json, not testable via API

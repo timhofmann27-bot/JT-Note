@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 mongo_url = os.environ['MONGO_URL']
 client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ.get('DB_NAME', 'heimatfunk_db')]
+db = client[os.environ.get('DB_NAME', 'ssnote_db')]
 
 JWT_SECRET = os.environ.get('JWT_SECRET')
 if not JWT_SECRET or len(JWT_SECRET) < 64:
@@ -39,7 +39,7 @@ REFRESH_TOKEN_DAYS = 7          # 7 Tage statt 30
 FRONTEND_URL = os.environ.get('FRONTEND_URL', os.environ.get('EXPO_PUBLIC_BACKEND_URL', '*'))
 BCRYPT_ROUNDS = 12              # Erhöht von Default 10
 
-app = FastAPI(title="444.HEIMAT-FUNK API", docs_url=None, redoc_url=None)
+app = FastAPI(title="SS-Note API", docs_url=None, redoc_url=None)
 api_router = APIRouter(prefix="/api")
 
 # ==================== WEBSOCKET: Real-time messaging ====================
@@ -357,6 +357,8 @@ def serialize_chat(chat: dict) -> dict:
         c["participant_ids"] = [str(p) for p in c["participant_ids"]]
     return c
 
+TESTING = os.environ.get('TESTING', 'false').lower() == 'true'
+
 # ==================== AUTH (ANONYMOUS — Username + Passkey) ====================
 
 @api_router.post("/auth/register")
@@ -364,21 +366,22 @@ async def register(input: RegisterInput, request: Request, response: Response):
     username = input.username.strip().lower()
     client_ip = request.client.host if request.client else "unknown"
     
-    # Rate limit
-    reg_key = f"reg:{client_ip}"
-    reg_attempt = await db.login_attempts.find_one_and_update(
-        {"identifier": reg_key},
-        {"$inc": {"count": 1}, "$set": {"last_attempt": datetime.now(timezone.utc)}, "$setOnInsert": {"locked_until": None}},
-        upsert=True, return_document=True
-    )
-    if reg_attempt and reg_attempt.get("count", 0) > 3:
-        last = reg_attempt.get("last_attempt")
-        if last:
-            if last.tzinfo is None: last = last.replace(tzinfo=timezone.utc)
-            if (datetime.now(timezone.utc) - last).total_seconds() < 60:
-                raise HTTPException(status_code=429, detail="Zu viele Registrierungen. Bitte warte 1 Minute.")
-            else:
-                await db.login_attempts.delete_one({"identifier": reg_key})
+    # Rate limit (disabled in testing mode)
+    if not TESTING:
+        reg_key = f"reg:{client_ip}"
+        reg_attempt = await db.login_attempts.find_one_and_update(
+            {"identifier": reg_key},
+            {"$inc": {"count": 1}, "$set": {"last_attempt": datetime.now(timezone.utc)}, "$setOnInsert": {"locked_until": None}},
+            upsert=True, return_document=True
+        )
+        if reg_attempt and reg_attempt.get("count", 0) > 3:
+            last = reg_attempt.get("last_attempt")
+            if last:
+                if last.tzinfo is None: last = last.replace(tzinfo=timezone.utc)
+                if (datetime.now(timezone.utc) - last).total_seconds() < 60:
+                    raise HTTPException(status_code=429, detail="Zu viele Registrierungen. Bitte warte 1 Minute.")
+                else:
+                    await db.login_attempts.delete_one({"identifier": reg_key})
     
     existing = await db.users.find_one({"username": username})
     if existing:
@@ -591,21 +594,22 @@ async def add_by_code(input: AddByCodeInput, request: Request, user: dict = Depe
     code = input.code.strip().upper()
     client_ip = request.client.host if request.client else "unknown"
     
-    # Rate limit: 5 code attempts/min
-    rl_key = f"addcode:{anonymize_ip(client_ip)}"
-    rl = await db.login_attempts.find_one_and_update(
-        {"identifier": rl_key},
-        {"$inc": {"count": 1}, "$set": {"last_attempt": datetime.now(timezone.utc)}, "$setOnInsert": {"locked_until": None}},
-        upsert=True, return_document=True
-    )
-    if rl and rl.get("count", 0) > 5:
-        last = rl.get("last_attempt")
-        if last:
-            if last.tzinfo is None: last = last.replace(tzinfo=timezone.utc)
-            if (datetime.now(timezone.utc) - last).total_seconds() < 60:
-                raise HTTPException(status_code=429, detail="Zu viele Versuche. Bitte warte 1 Minute.")
-            else:
-                await db.login_attempts.delete_one({"identifier": rl_key})
+    # Rate limit: 5 code attempts/min (disabled in testing mode)
+    if not TESTING:
+        rl_key = f"addcode:{anonymize_ip(client_ip)}"
+        rl = await db.login_attempts.find_one_and_update(
+            {"identifier": rl_key},
+            {"$inc": {"count": 1}, "$set": {"last_attempt": datetime.now(timezone.utc)}, "$setOnInsert": {"locked_until": None}},
+            upsert=True, return_document=True
+        )
+        if rl and rl.get("count", 0) > 5:
+            last = rl.get("last_attempt")
+            if last:
+                if last.tzinfo is None: last = last.replace(tzinfo=timezone.utc)
+                if (datetime.now(timezone.utc) - last).total_seconds() < 60:
+                    raise HTTPException(status_code=429, detail="Zu viele Versuche. Bitte warte 1 Minute.")
+                else:
+                    await db.login_attempts.delete_one({"identifier": rl_key})
     
     target = await db.users.find_one({"add_me_code": code})
     if not target:
@@ -914,7 +918,7 @@ async def get_typing(chat_id: str, user: dict = Depends(get_current_user)):
 
 @api_router.get("/health")
 async def health():
-    return {"status": "ok", "service": "444.HEIMAT-FUNK", "timestamp": datetime.now(timezone.utc).isoformat()}
+    return {"status": "ok", "service": "SS-Note", "timestamp": datetime.now(timezone.utc).isoformat()}
 
 # ==================== USERNAME GENERATOR ====================
 
@@ -1119,7 +1123,7 @@ async def startup():
     
     creds_path = Path("/app/memory/test_credentials.md")
     creds_path.parent.mkdir(parents=True, exist_ok=True)
-    creds_path.write_text("""# 444.HEIMAT-FUNK Test Credentials (ANONYMOUS AUTH)
+    creds_path.write_text("""# SS-Note Test Credentials (ANONYMOUS AUTH)
 
 ## Admin Account
 - Username: wolf-1
@@ -1138,7 +1142,7 @@ async def startup():
 - POST /api/auth/change-passkey {old_passkey, new_passkey}
 - GET /api/auth/me
 """)
-    logger.info("444.HEIMAT-FUNK Server gestartet (Anonyme Auth)!")
+    logger.info("SS-Note Server gestartet (Anonyme Auth)!")
 
 @app.on_event("shutdown")
 async def shutdown():

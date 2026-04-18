@@ -26,7 +26,6 @@ export default function ChatsScreen() {
 
   useFocusEffect(useCallback(() => { loadChats(); }, [loadChats]));
 
-  // Poll for updates
   useEffect(() => {
     const interval = setInterval(async () => {
       try {
@@ -48,10 +47,13 @@ export default function ChatsScreen() {
     return other?.name || 'Unbekannt';
   };
 
-  const getChatCallsign = (chat: any) => {
-    if (chat.is_group) return `${chat.participants?.length || 0} Teilnehmer`;
+  const getChatSubtitle = (chat: any) => {
+    if (chat.is_group) {
+      const count = chat.participants?.length || 0;
+      return `${count} Teilnehmer${count > 1 ? 'innen' : ''}`;
+    }
     const other = getOtherParticipant(chat);
-    return other?.callsign || '';
+    return other?.status === 'online' ? 'Online' : 'Offline';
   };
 
   const getStatusColor = (chat: any) => {
@@ -84,8 +86,28 @@ export default function ChatsScreen() {
     return map[level] || COLORS.unclassified;
   };
 
+  const getGroupInitials = (chat: any) => {
+    if (!chat.is_group || !chat.name) return '';
+    return chat.name.split(' ').map((w: string) => w[0]).join('').substring(0, 2).toUpperCase();
+  };
+
+  const getContactInitial = (chat: any) => {
+    const other = getOtherParticipant(chat);
+    return other?.name?.charAt(0).toUpperCase() || '?';
+  };
+
+  const getAvatarColor = (id: string) => {
+    const colors = [COLORS.primary, '#4A90D9', '#7B68EE', '#20B2AA', '#FF6B6B', '#FFD93D', '#6BCB77'];
+    let hash = 0;
+    for (let i = 0; i < id.length; i++) hash = id.charCodeAt(i) + ((hash << 5) - hash);
+    return colors[Math.abs(hash) % colors.length];
+  };
+
   const renderChat = ({ item }: { item: any }) => {
     const roleInfo = getRoleInfo(item);
+    const avatarColor = getAvatarColor(item.id);
+    const isGroup = item.is_group;
+
     return (
       <TouchableOpacity
         testID={`chat-item-${item.id}`}
@@ -94,10 +116,14 @@ export default function ChatsScreen() {
         activeOpacity={0.7}
       >
         <View style={styles.avatarContainer}>
-          <View style={[styles.avatar, item.is_group && styles.groupAvatar]}>
-            <Ionicons name={item.is_group ? 'people' : 'person'} size={22} color={COLORS.textSecondary} />
+          <View style={[styles.avatar, isGroup && styles.groupAvatar, { backgroundColor: isGroup ? `${avatarColor}33` : COLORS.surfaceLight, borderColor: isGroup ? avatarColor : COLORS.border }]}>
+            {isGroup ? (
+              <Text style={[styles.avatarInitial, { color: avatarColor }]}>{getGroupInitials(item)}</Text>
+            ) : (
+              <Text style={styles.avatarInitial}>{getContactInitial(item)}</Text>
+            )}
           </View>
-          <View style={[styles.statusDot, { backgroundColor: getStatusColor(item) }]} />
+          {!isGroup && <View style={[styles.statusDot, { backgroundColor: getStatusColor(item) }]} />}
         </View>
 
         <View style={styles.chatInfo}>
@@ -114,7 +140,10 @@ export default function ChatsScreen() {
           </View>
 
           <View style={styles.chatSubRow}>
-            <Text style={styles.callsign}>{getChatCallsign(item)}</Text>
+            <View style={styles.subLeft}>
+              <Ionicons name={isGroup ? 'people' : item.participants?.[0]?.status === 'online' ? 'circle' : 'ellipse-outline'} size={10} color={getStatusColor(item)} />
+              <Text style={styles.callsign}>{getChatSubtitle(item)}</Text>
+            </View>
             {item.security_level !== 'UNCLASSIFIED' && (
               <View style={[styles.secBadge, { borderColor: getSecurityColor(item.security_level) }]}>
                 <Text style={[styles.secText, { color: getSecurityColor(item.security_level) }]}>{item.security_level}</Text>
@@ -123,8 +152,8 @@ export default function ChatsScreen() {
           </View>
 
           <View style={styles.lastMsgRow}>
-            <Ionicons name="lock-closed" size={10} color={COLORS.primaryLight} />
-            <Text style={styles.lastMsg} numberOfLines={1}>{item.last_message || 'Verschlüsselter Kanal'}</Text>
+            <Ionicons name="lock-closed" size={10} color={COLORS.textMuted} />
+            <Text style={styles.lastMsg} numberOfLines={1}>{item.last_message || (isGroup ? 'Gruppenchat erstellt' : 'Verschlüsselter Kanal')}</Text>
             {(item.unread_count || 0) > 0 && (
               <View style={styles.unreadBadge}>
                 <Text style={styles.unreadText}>{item.unread_count}</Text>
@@ -149,10 +178,18 @@ export default function ChatsScreen() {
       {chats.length === 0 ? (
         <View style={styles.emptyContainer}>
           <View style={styles.emptyIcon}>
-            <Ionicons name="radio-outline" size={48} color={COLORS.textMuted} />
+            <Ionicons name="chatbubbles-outline" size={48} color={COLORS.textMuted} />
           </View>
-          <Text style={styles.emptyTitle}>Keine aktiven Kanäle</Text>
-          <Text style={styles.emptySubtitle}>Starte einen neuen verschlüsselten Kanal über den Kontakte-Tab</Text>
+          <Text style={styles.emptyTitle}>Noch keine Chats</Text>
+          <Text style={styles.emptySubtitle}>Erstelle einen neuen Chat oder eine Gruppe</Text>
+          <TouchableOpacity
+            testID="empty-new-chat-btn"
+            style={styles.emptyCta}
+            onPress={() => router.push('/new-chat')}
+          >
+            <Ionicons name="add" size={18} color={COLORS.white} />
+            <Text style={styles.emptyCtaText}>Neuen Chat starten</Text>
+          </TouchableOpacity>
         </View>
       ) : (
         <FlatList
@@ -179,13 +216,14 @@ const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: COLORS.background },
   center: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: COLORS.background },
   listContent: { paddingVertical: 8 },
-  chatItem: { flexDirection: 'row', paddingHorizontal: 16, paddingVertical: 14, alignItems: 'center' },
+  chatItem: { flexDirection: 'row', paddingHorizontal: 16, paddingVertical: 12, alignItems: 'center' },
   avatarContainer: { position: 'relative', marginRight: 14 },
   avatar: {
-    width: 50, height: 50, borderRadius: 25, backgroundColor: COLORS.surfaceLight,
-    alignItems: 'center', justifyContent: 'center', borderWidth: 1, borderColor: COLORS.border,
+    width: 50, height: 50, borderRadius: 25,
+    alignItems: 'center', justifyContent: 'center', borderWidth: 1,
   },
-  groupAvatar: { borderColor: COLORS.primary },
+  groupAvatar: { borderRadius: 14 },
+  avatarInitial: { fontSize: FONTS.sizes.lg, fontWeight: FONTS.weights.bold, color: COLORS.textSecondary },
   statusDot: { position: 'absolute', bottom: 1, right: 1, width: 12, height: 12, borderRadius: 6, borderWidth: 2, borderColor: COLORS.background },
   chatInfo: { flex: 1 },
   chatHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
@@ -194,8 +232,9 @@ const styles = StyleSheet.create({
   roleBadge: { paddingHorizontal: 6, paddingVertical: 1, borderRadius: 4 },
   roleText: { fontSize: 9, fontWeight: FONTS.weights.bold, letterSpacing: 0.5 },
   chatTime: { fontSize: FONTS.sizes.xs, color: COLORS.textMuted },
-  chatSubRow: { flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 2 },
-  callsign: { fontSize: FONTS.sizes.xs, color: COLORS.textSecondary, fontWeight: FONTS.weights.medium, letterSpacing: 1 },
+  chatSubRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 8, marginTop: 2 },
+  subLeft: { flexDirection: 'row', alignItems: 'center', gap: 4 },
+  callsign: { fontSize: FONTS.sizes.xs, color: COLORS.textSecondary, fontWeight: FONTS.weights.medium },
   secBadge: { paddingHorizontal: 4, paddingVertical: 1, borderRadius: 3, borderWidth: 1 },
   secText: { fontSize: 8, fontWeight: FONTS.weights.bold, letterSpacing: 0.5 },
   lastMsgRow: { flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 4 },
@@ -209,7 +248,9 @@ const styles = StyleSheet.create({
   emptyContainer: { flex: 1, justifyContent: 'center', alignItems: 'center', padding: 40 },
   emptyIcon: { width: 80, height: 80, borderRadius: 40, backgroundColor: COLORS.surface, alignItems: 'center', justifyContent: 'center', marginBottom: 16 },
   emptyTitle: { fontSize: FONTS.sizes.lg, fontWeight: FONTS.weights.semibold, color: COLORS.textPrimary, marginBottom: 8 },
-  emptySubtitle: { fontSize: FONTS.sizes.sm, color: COLORS.textMuted, textAlign: 'center', lineHeight: 20 },
+  emptySubtitle: { fontSize: FONTS.sizes.sm, color: COLORS.textMuted, textAlign: 'center', lineHeight: 20, marginBottom: 24 },
+  emptyCta: { flexDirection: 'row', alignItems: 'center', gap: 8, backgroundColor: COLORS.primary, borderRadius: 12, paddingHorizontal: 20, paddingVertical: 12 },
+  emptyCtaText: { fontSize: FONTS.sizes.base, fontWeight: FONTS.weights.bold, color: COLORS.white },
   fab: {
     position: 'absolute', bottom: 20, right: 20, width: 56, height: 56, borderRadius: 28,
     backgroundColor: COLORS.primary, alignItems: 'center', justifyContent: 'center',
