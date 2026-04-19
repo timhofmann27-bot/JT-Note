@@ -3,59 +3,76 @@ import { Tabs } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
 import { COLORS, FONTS } from '../../src/utils/theme';
 import { View, Text, StyleSheet } from 'react-native';
+import BiometricLock from '../../src/components/BiometricLock';
+import * as SecureStore from 'expo-secure-store';
+import { useState, useEffect } from 'react';
 
 export default function TabLayout() {
+  const [biometricEnabled, setBiometricEnabled] = useState(false);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    SecureStore.getItemAsync('biometric_lock').then(val => {
+      setBiometricEnabled(val === 'true');
+      setLoading(false);
+    }).catch(() => setLoading(false));
+  }, []);
+
+  if (loading) return null;
+
   return (
-    <Tabs
-      screenOptions={{
-        headerShown: true,
-        headerStyle: { backgroundColor: COLORS.surface, elevation: 0, shadowOpacity: 0, borderBottomWidth: 1, borderBottomColor: COLORS.border },
-        headerTintColor: COLORS.textPrimary,
-        headerTitleStyle: { fontWeight: '700', letterSpacing: 1 },
-        tabBarStyle: {
-          backgroundColor: COLORS.surface,
-          borderTopColor: COLORS.border,
-          borderTopWidth: 1,
-          height: 60,
-          paddingBottom: 8,
-          paddingTop: 4,
-        },
-        tabBarActiveTintColor: COLORS.primaryLight,
-        tabBarInactiveTintColor: COLORS.textMuted,
-        tabBarLabelStyle: { fontSize: 10, fontWeight: '600', letterSpacing: 1 },
-      }}
-    >
-      <Tabs.Screen
-        name="chats"
-        options={{
-          title: 'FUNK',
-          headerTitle: () => (
-            <View style={styles.headerTitle}>
-              <Ionicons name="document-text" size={20} color={COLORS.primaryLight} />
-              <Text style={styles.headerTitleText}>SS-Note</Text>
-            </View>
-          ),
-          tabBarIcon: ({ color, size }) => <Ionicons name="chatbubbles" size={size} color={color} />,
-          tabBarLabel: 'FUNK',
+    <BiometricLock enabled={biometricEnabled}>
+      <Tabs
+        screenOptions={{
+          headerShown: true,
+          headerStyle: { backgroundColor: COLORS.surface, elevation: 0, shadowOpacity: 0, borderBottomWidth: 1, borderBottomColor: COLORS.border },
+          headerTintColor: COLORS.textPrimary,
+          headerTitleStyle: { fontWeight: '700', letterSpacing: 1 },
+          tabBarStyle: {
+            backgroundColor: COLORS.surface,
+            borderTopColor: COLORS.border,
+            borderTopWidth: 1,
+            height: 60,
+            paddingBottom: 8,
+            paddingTop: 4,
+          },
+          tabBarActiveTintColor: COLORS.primaryLight,
+          tabBarInactiveTintColor: COLORS.textMuted,
+          tabBarLabelStyle: { fontSize: 10, fontWeight: '600', letterSpacing: 1 },
         }}
-      />
-      <Tabs.Screen
-        name="contacts"
-        options={{
-          title: 'KONTAKTE',
-          tabBarIcon: ({ color, size }) => <Ionicons name="people" size={size} color={color} />,
-          tabBarLabel: 'KONTAKTE',
-        }}
-      />
-      <Tabs.Screen
-        name="settings"
-        options={{
-          title: 'EINSTELLUNGEN',
-          tabBarIcon: ({ color, size }) => <Ionicons name="settings" size={size} color={color} />,
-          tabBarLabel: 'PROFIL',
-        }}
-      />
-    </Tabs>
+      >
+        <Tabs.Screen
+          name="chats"
+          options={{
+            title: 'FUNK',
+            headerTitle: () => (
+              <View style={styles.headerTitle}>
+                <Ionicons name="document-text" size={20} color={COLORS.primaryLight} />
+                <Text style={styles.headerTitleText}>SS-Note</Text>
+              </View>
+            ),
+            tabBarIcon: ({ color, size }) => <Ionicons name="chatbubbles" size={size} color={color} />,
+            tabBarLabel: 'FUNK',
+          }}
+        />
+        <Tabs.Screen
+          name="contacts"
+          options={{
+            title: 'KONTAKTE',
+            tabBarIcon: ({ color, size }) => <Ionicons name="people" size={size} color={color} />,
+            tabBarLabel: 'KONTAKTE',
+          }}
+        />
+        <Tabs.Screen
+          name="settings"
+          options={{
+            title: 'EINSTELLUNGEN',
+            tabBarIcon: ({ color, size }) => <Ionicons name="settings" size={size} color={color} />,
+            tabBarLabel: 'PROFIL',
+          }}
+        />
+      </Tabs>
+    </BiometricLock>
   );
 }
 

@@ -1,10 +1,12 @@
-import React, { useState } from 'react';
-import { View, Text, TouchableOpacity, StyleSheet, ScrollView, TextInput, Alert, ActivityIndicator, Image } from 'react-native';
+import React, { useState, useEffect } from 'react';
+import { View, Text, TouchableOpacity, StyleSheet, ScrollView, TextInput, Alert, ActivityIndicator, Image, Switch } from 'react-native';
 import { useRouter } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
 import { useAuth } from '../../src/context/AuthContext';
 import { profileAPI, authAPI, contactsAPI } from '../../src/utils/api';
 import { COLORS, FONTS, SPACING, ROLES } from '../../src/utils/theme';
+import * as SecureStore from 'expo-secure-store';
+import * as LocalAuthentication from 'expo-local-authentication';
 
 export default function SettingsScreen() {
   const { user, logout, refreshUser } = useAuth();
@@ -22,6 +24,17 @@ export default function SettingsScreen() {
   const [qrLoading, setQrLoading] = useState(false);
   const [addCode, setAddCode] = useState('');
   const [codeLoading, setCodeLoading] = useState(false);
+  const [biometricEnabled, setBiometricEnabled] = useState(false);
+  const [biometricAvailable, setBiometricAvailable] = useState(false);
+
+  useEffect(() => {
+    SecureStore.getItemAsync('biometric_lock').then(val => {
+      setBiometricEnabled(val === 'true');
+    });
+    LocalAuthentication.hasHardwareAsync().then(has => {
+      if (has) LocalAuthentication.isEnrolledAsync().then(enrolled => setBiometricAvailable(has && enrolled));
+    });
+  }, []);
 
   const handleSave = async () => {
     try {
@@ -134,6 +147,26 @@ export default function SettingsScreen() {
               <Text style={styles.secValue}>Aktiviert</Text>
             </View>
           </View>
+          {biometricAvailable && (
+            <>
+              <View style={styles.secDivider} />
+              <View style={styles.secRow}>
+                <Ionicons name="finger-print" size={20} color={biometricEnabled ? COLORS.success : COLORS.textMuted} />
+                <View style={styles.secInfo}>
+                  <Text style={styles.secLabel}>Biometrische Sperre</Text>
+                  <Switch
+                    value={biometricEnabled}
+                    onValueChange={async (val) => {
+                      await SecureStore.setItemAsync('biometric_lock', val ? 'true' : 'false');
+                      setBiometricEnabled(val);
+                    }}
+                    trackColor={{ false: COLORS.textMuted, true: COLORS.primary }}
+                    thumbColor={COLORS.white}
+                  />
+                </View>
+              </View>
+            </>
+          )}
         </View>
       </View>
 
