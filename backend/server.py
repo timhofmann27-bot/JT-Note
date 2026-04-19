@@ -1390,6 +1390,91 @@ async def get_user_keys_batch(user_ids: str, user: dict = Depends(get_current_us
         }
     return {"keys": result}
 
+# ==================== E2EE: PREKEY BUNDLES (X3DH) ====================
+
+class PrekeyBundleUpload(BaseModel):
+    signed_prekey_id: str
+    signed_prekey: str  # base64
+    signature: str  # base64 — Ed25519 signature of signed_prekey
+    identity_key: str  # base64 — Ed25519 signing public key
+    one_time_prekeys: List[dict] = []  # [{id: str, key: str (base64)}]
+
+@api_router.post("/keys/prekeys")
+async def upload_prekeys(input: PrekeyBundleUpload, request: Request, user: dict = Depends(get_current_user)):
+    """Upload X3DH prekey bundle: signed prekey + optional one-time prekeys"""
+    if not BASE64_REGEX.match(input.signed_prekey):
+        raise HTTPException(status_code=400, detail="Ungültiger Signed Prekey")
+    if not BASE64_REGEX.match(input.signature):
+        raise HTTPException(status_code=400, detail="Ungültige Signatur")
+    if not BASE64_REGEX.match(input.identity_key):
+        raise HTTPException(status_code=400, detail="Ungültiger Identity Key")
+
+    # Validate OTP keys
+    for otp in input.one_time_prekeys:
+        if not BASE64_REGEX.match(otp.get("key", "")):
+            raise HTTPException(status_code=400, detail=f"Ungültiger One-Time Prekey: {otp.get('id')}")
+
+    await db.user_keys.update_one(
+        {"user_id": user["id"]},
+        {"$set": {
+            "signed_prekey_id": input.signed_prekey_id,
+            "signed_prekey": input.signed_prekey,
+            "signature": input.signature,
+            "identity_key": input.identity_key,
+            "updated_at": datetime.now(timezone.utc),
+        }},
+        upsert=True
+    )
+
+    # Store one-time prekeys (upsert, max 100)
+    if input.one_time_prekeys:
+        existing_otps = await db.prekeys.find({"user_id": user["id"], "type": "otp"}).to_list(200)
+        existing_ids = {k["otp_id"] for k in existing_otps}
+        new_otps = []
+        for otp in input.one_time_prekeys:
+            if otp["id"] not in existing_ids:
+                new_otps.append({
+                    "user_id": user["id"],
+                    "otp_id": otp["id"],
+                    "key": otp["key"],
+                    "type": "otp",
+                    "created_at": datetime.now(timezone.utc),
+                })
+        if new_otps:
+            # Cap total OTPs at 100
+            total = len(existing_otps) + len(new_otps)
+            if total > 100:
+                new_otps = new_otps[:100 - len(existing_otps)]
+            await db.prekeys.insert_many(new_otps)
+
+    await audit_log("prekeys_uploaded", user["id"])
+    return {"message": "Prekeys gespeichert", "count": len(input.one_time_prekeys)}
+
+@api_router.get("/keys/prekeys/{user_id}")
+async def get_prekey_bundle(user_id: str, user: dict = Depends(get_current_user)):
+    """Get another user's X3DH prekey bundle for session initialization"""
+    key_doc = await db.user_keys.find_one({"user_id": user_id})
+    if not key_doc:
+        raise HTTPException(status_code=404, detail="Public key nicht gefunden")
+
+    # Fetch available one-time prekeys (limit 10)
+    otps = await db.prekeys.find({"user_id": user_id, "type": "otp"}).sort("created_at", 1).to_list(10)
+
+    return {
+        "user_id": user_id,
+        "identity_key": key_doc.get("identity_key", key_doc.get("public_key")),
+        "signed_prekey_id": key_doc.get("signed_prekey_id"),
+        "signed_prekey": key_doc.get("signed_prekey"),
+        "signature": key_doc.get("signature"),
+        "one_time_prekeys": [{"id": o["otp_id"], "key": o["key"]} for o in otps],
+    }
+
+@api_router.delete("/keys/prekeys/{user_id}/{otp_id}")
+async def consume_prekey(user_id: str, otp_id: str, user: dict = Depends(get_current_user)):
+    """Mark a one-time prekey as consumed (called by sender after using it)"""
+    await db.prekeys.delete_one({"user_id": user_id, "otp_id": otp_id, "type": "otp"})
+    return {"message": "Prekey verbraucht"}
+
 # ==================== PUSH NOTIFICATIONS (E2EE-safe) ====================
 
 @api_router.post("/push/register")

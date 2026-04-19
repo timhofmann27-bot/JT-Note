@@ -122,6 +122,15 @@ export const keysAPI = {
     api.post('/keys/upload', { public_key: publicKey, fingerprint }),
   get: (userId: string) => api.get(`/keys/${userId}`),
   getBatch: (userIds: string[]) => api.get('/keys/batch', { params: { user_ids: userIds.join(',') } }),
+  uploadPrekeys: (data: {
+    signed_prekey_id: string;
+    signed_prekey: string;
+    signature: string;
+    identity_key: string;
+    one_time_prekeys: { id: string; key: string }[];
+  }) => api.post('/keys/prekeys', data),
+  getPrekeyBundle: (userId: string) => api.get(`/keys/prekeys/${userId}`),
+  consumePrekey: (userId: string, otpId: string) => api.delete(`/keys/prekeys/${userId}/${otpId}`),
 };
 
 export const pushAPI = {

@@ -4,6 +4,9 @@ import { utf8Encode, utf8Decode } from 'tweetnacl-util';
 
 // Storage keys
 const KEYPAIR_STORAGE = 'tn-keybox';
+const SIGNING_KEYPAIR_STORAGE = 'tn-signing-keybox';
+const SIGNED_PREKEY_STORAGE = 'tn-signed-prekey';
+const OTP_STORAGE_PREFIX = 'tn-otp-';
 const SESSION_PREFIX = 'tn-session-';
 const GROUP_SESSION_PREFIX = 'tn-group-session-';
 const SENDER_KEY_PREFIX = 'tn-sender-key-';
@@ -32,6 +35,121 @@ export async function getKeyPair(): Promise<naclBoxKeyPair | null> {
     publicKey: raw.slice(0, nacl.box.publicKeyLength),
     secretKey: raw.slice(nacl.box.publicKeyLength),
   };
+}
+
+// ==================== Signing Key Management (Ed25519) ====================
+
+export async function storeSigningKeyPair(keyPair: naclSignKeyPair) {
+  const combined = new Uint8Array([...keyPair.publicKey, ...keyPair.secretKey]);
+  await SecureStore.setItemAsync(SIGNING_KEYPAIR_STORAGE, nacl.encodeBase64(combined));
+}
+
+export async function getSigningKeyPair(): Promise<naclSignKeyPair | null> {
+  const stored = await SecureStore.getItemAsync(SIGNING_KEYPAIR_STORAGE);
+  if (!stored) return null;
+  const raw = nacl.decodeBase64(stored);
+  if (raw.length !== nacl.sign.publicKeyLength + nacl.sign.secretKeyLength) return null;
+  return {
+    publicKey: raw.slice(0, nacl.sign.publicKeyLength),
+    secretKey: raw.slice(nacl.sign.publicKeyLength),
+  };
+}
+
+// ==================== Prekey Management ====================
+
+export async function storeSignedPrekey(id: string, keyPair: naclBoxKeyPair, signature: Uint8Array) {
+  const data = JSON.stringify({
+    id,
+    publicKey: nacl.encodeBase64(keyPair.publicKey),
+    secretKey: nacl.encodeBase64(keyPair.secretKey),
+    signature: nacl.encodeBase64(signature),
+  });
+  await SecureStore.setItemAsync(SIGNED_PREKEY_STORAGE, data);
+}
+
+export async function getSignedPrekey(): Promise<{ id: string; keyPair: naclBoxKeyPair; signature: Uint8Array } | null> {
+  const stored = await SecureStore.getItemAsync(SIGNED_PREKEY_STORAGE);
+  if (!stored) return null;
+  try {
+    const d = JSON.parse(stored);
+    return {
+      id: d.id,
+      keyPair: {
+        publicKey: nacl.decodeBase64(d.publicKey),
+        secretKey: nacl.decodeBase64(d.secretKey),
+      },
+      signature: nacl.decodeBase64(d.signature),
+    };
+  } catch { return null; }
+}
+
+export async function storeOneTimePrekey(record: PrekeyRecord) {
+  const data = JSON.stringify({
+    id: record.id,
+    publicKey: nacl.encodeBase64(record.publicKey),
+    secretKey: nacl.encodeBase64(record.secretKey),
+    timestamp: record.timestamp,
+  });
+  await SecureStore.setItemAsync(`${OTP_STORAGE_PREFIX}${record.id}`, data);
+}
+
+export async function getOneTimePrekeys(): Promise<PrekeyRecord[]> {
+  const keys: PrekeyRecord[] = [];
+  // SecureStore doesn't support listing, so we store a manifest
+  const manifest = await SecureStore.getItemAsync(`${OTP_STORAGE_PREFIX}manifest`);
+  if (!manifest) return keys;
+  try {
+    const ids: string[] = JSON.parse(manifest);
+    for (const id of ids) {
+      const stored = await SecureStore.getItemAsync(`${OTP_STORAGE_PREFIX}${id}`);
+      if (stored) {
+        const d = JSON.parse(stored);
+        keys.push({
+          id: d.id,
+          publicKey: nacl.decodeBase64(d.publicKey),
+          secretKey: nacl.decodeBase64(d.secretKey),
+          timestamp: d.timestamp,
+        });
+      }
+    }
+  } catch {}
+  return keys;
+}
+
+export async function setOneTimePrekeys(records: PrekeyRecord[]) {
+  // Clear old
+  const old = await getOneTimePrekeys();
+  for (const r of old) {
+    try { await SecureStore.deleteItemAsync(`${OTP_STORAGE_PREFIX}${r.id}`); } catch {}
+  }
+  // Store new
+  for (const r of records) {
+    await storeOneTimePrekey(r);
+  }
+  // Update manifest
+  await SecureStore.setItemAsync(`${OTP_STORAGE_PREFIX}manifest`, JSON.stringify(records.map(r => r.id)));
+}
+
+export async function consumeOneTimePrekey(id: string): Promise<naclBoxKeyPair | null> {
+  const stored = await SecureStore.getItemAsync(`${OTP_STORAGE_PREFIX}${id}`);
+  if (!stored) return null;
+  try {
+    const d = JSON.parse(stored);
+    const keyPair = {
+      publicKey: nacl.decodeBase64(d.publicKey),
+      secretKey: nacl.decodeBase64(d.secretKey),
+    };
+    // Remove consumed key
+    await SecureStore.deleteItemAsync(`${OTP_STORAGE_PREFIX}${id}`);
+    // Update manifest
+    const manifest = await SecureStore.getItemAsync(`${OTP_STORAGE_PREFIX}manifest`);
+    if (manifest) {
+      const ids: string[] = JSON.parse(manifest);
+      const filtered = ids.filter(x => x !== id);
+      await SecureStore.setItemAsync(`${OTP_STORAGE_PREFIX}manifest`, JSON.stringify(filtered));
+    }
+    return keyPair;
+  } catch { return null; }
 }
 
 // ==================== Proper HMAC-SHA256 ====================
@@ -149,6 +267,8 @@ export interface SessionState {
   theirIdentityKey: Uint8Array;
   ourIdentityKey: naclBoxKeyPair;
   lastRemoteDHPublicKey: Uint8Array | null;
+  usedOtpId?: string | null;
+  ephemeralPublicKey?: Uint8Array | null;
 }
 
 // ==================== Group Sender Key State ====================
@@ -173,7 +293,185 @@ export interface GroupSessionState {
   members: Map<string, Uint8Array>;
 }
 
-// ==================== Initial Key Exchange (X3DH-like) ====================
+// ==================== Prekey System (X3DH) ====================
+// Signal/Double Ratchet X3DH Pattern:
+// - Identity Key (langfristig, signiert Prekeys)
+// - Signed Prekey (mittelfristig, von Identity Key signiert)
+// - One-Time Prekeys (einmalig, nach Verbrauch löschen)
+// Ermöglicht asynchrone Session-Initialisierung: Sender kann E2EE starten,
+// auch wenn Empfänger offline ist.
+
+export interface PrekeyBundle {
+  identityKey: string;        // base64
+  signedPreKey: string;       // base64
+  signedPreKeyId: string;
+  signature: string;          // base64 — Ed25519 signature of signedPreKey
+  oneTimePreKeys: { id: string; key: string }[];  // base64 keys
+}
+
+export interface PrekeyRecord {
+  id: string;
+  publicKey: Uint8Array;
+  secretKey: Uint8Array;
+  timestamp: number;
+}
+
+// Generate a batch of one-time prekeys
+export function generateOneTimePrekeys(count: number = 10): PrekeyRecord[] {
+  const keys: PrekeyRecord[] = [];
+  for (let i = 0; i < count; i++) {
+    const keyPair = nacl.box.keyPair();
+    keys.push({
+      id: `otp-${Date.now()}-${nacl.encodeBase64(keyPair.publicKey).slice(0, 8)}`,
+      publicKey: keyPair.publicKey,
+      secretKey: keyPair.secretKey,
+      timestamp: Date.now(),
+    });
+  }
+  return keys;
+}
+
+// Generate a signed prekey (signed with Ed25519 identity key)
+export function generateSignedPrekey(identitySigningKey: naclSignKeyPair): {
+  id: string;
+  keyPair: naclBoxKeyPair;
+  signature: Uint8Array;
+} {
+  const keyPair = nacl.box.keyPair();
+  const signature = nacl.sign.detached(keyPair.publicKey, identitySigningKey.secretKey);
+  return {
+    id: `spk-${Date.now()}`,
+    keyPair,
+    signature,
+  };
+}
+
+// X3DH: Initialize session using prekey bundle (full X3DH with 3/4 DH exchanges)
+export async function initializeSessionX3DH(
+  ourIdentityKey: naclBoxKeyPair,
+  ourSigningKey: naclSignKeyPair,
+  theirBundle: PrekeyBundle,
+  chatId: string
+): Promise<SessionState | null> {
+  const theirIdentityKey = nacl.decodeBase64(theirBundle.identityKey);
+  const theirSignedPreKey = nacl.decodeBase64(theirBundle.signedPreKey);
+  const theirSignature = nacl.decodeBase64(theirBundle.signature);
+
+  // Verify signed prekey signature
+  if (!nacl.sign.detached.verify(theirSignedPreKey, theirSignature, theirIdentityKey)) {
+    return null; // Invalid signature — possible MITM
+  }
+
+  // Pick a one-time prekey if available
+  let theirOneTimePreKey: Uint8Array | null = null;
+  let usedOtpId: string | null = null;
+  if (theirBundle.oneTimePreKeys.length > 0) {
+    const otp = theirBundle.oneTimePreKeys[0];
+    theirOneTimePreKey = nacl.decodeBase64(otp.key);
+    usedOtpId = otp.id;
+  }
+
+  // DH computations (X3DH)
+  // DH1: Our Identity (secret) × Their Signed PreKey (public)
+  const dh1 = nacl.box.before(theirSignedPreKey, ourIdentityKey.secretKey);
+  // DH2: Our Identity (secret) × Their Identity (public)
+  const dh2 = nacl.box.before(theirIdentityKey, ourIdentityKey.secretKey);
+  // DH3: Our Ephemeral (secret) × Their Signed PreKey (public)
+  const ephemeralKeyPair = nacl.box.keyPair();
+  const dh3 = nacl.box.before(theirSignedPreKey, ephemeralKeyPair.secretKey);
+
+  let sharedSecret: Uint8Array;
+  if (theirOneTimePreKey) {
+    // DH4: Our Ephemeral (secret) × Their One-Time PreKey (public)
+    const dh4 = nacl.box.before(theirOneTimePreKey, ephemeralKeyPair.secretKey);
+    // SK = KDF(DH1 || DH2 || DH3 || DH4)
+    const combined = new Uint8Array([...dh1, ...dh2, ...dh3, ...dh4]);
+    sharedSecret = hkdf(combined, 'ssnote-x3dh-4way', 32);
+  } else {
+    // 3-way fallback (no OTP available)
+    const combined = new Uint8Array([...dh1, ...dh2, ...dh3]);
+    sharedSecret = hkdf(combined, 'ssnote-x3dh-3way', 32);
+  }
+
+  const rootKey = hkdf(sharedSecret, 'ssnote-root', 32);
+  const chainKey = hkdf(sharedSecret, 'ssnote-chain', 32);
+
+  // Create new DH keypair for the ratchet
+  const dhKeyPair = nacl.box.keyPair();
+
+  const session: SessionState = {
+    ratchet: {
+      dhKeyPair,
+      dhRemotePublicKey: theirSignedPreKey,
+      rootKey,
+      chainKey,
+      messageNumber: 0,
+    },
+    isInitialized: true,
+    theirIdentityKey,
+    ourIdentityKey,
+    lastRemoteDHPublicKey: theirSignedPreKey,
+    usedOtpId,
+    ephemeralPublicKey: ephemeralKeyPair.publicKey,
+  };
+
+  await saveSession(chatId, session);
+  return session;
+}
+
+// X3DH: Process incoming session initialization (recipient side)
+export async function initializeSessionFromPrekey(
+  ourIdentityKey: naclBoxKeyPair,
+  ourSigningKey: naclSignKeyPair,
+  ourSignedPreKey: naclBoxKeyPair,
+  ourOneTimePreKey: naclBoxKeyPair | null,
+  theirIdentityKey: Uint8Array,
+  theirEphemeralKey: Uint8Array,
+  chatId: string
+): Promise<SessionState> {
+  // DH computations (mirror of sender side)
+  // DH1: Our Signed PreKey (secret) × Their Identity (public)
+  const dh1 = nacl.box.before(theirIdentityKey, ourSignedPreKey.secretKey);
+  // DH2: Our Identity (secret) × Their Identity (public)
+  const dh2 = nacl.box.before(theirIdentityKey, ourIdentityKey.secretKey);
+  // DH3: Our Signed PreKey (secret) × Their Ephemeral (public)
+  const dh3 = nacl.box.before(theirEphemeralKey, ourSignedPreKey.secretKey);
+
+  let sharedSecret: Uint8Array;
+  if (ourOneTimePreKey) {
+    // DH4: Our One-Time PreKey (secret) × Their Ephemeral (public)
+    const dh4 = nacl.box.before(theirEphemeralKey, ourOneTimePreKey.secretKey);
+    const combined = new Uint8Array([...dh1, ...dh2, ...dh3, ...dh4]);
+    sharedSecret = hkdf(combined, 'ssnote-x3dh-4way', 32);
+  } else {
+    const combined = new Uint8Array([...dh1, ...dh2, ...dh3]);
+    sharedSecret = hkdf(combined, 'ssnote-x3dh-3way', 32);
+  }
+
+  const rootKey = hkdf(sharedSecret, 'ssnote-root', 32);
+  const chainKey = hkdf(sharedSecret, 'ssnote-chain', 32);
+
+  const dhKeyPair = nacl.box.keyPair();
+
+  const session: SessionState = {
+    ratchet: {
+      dhKeyPair,
+      dhRemotePublicKey: theirEphemeralKey,
+      rootKey,
+      chainKey,
+      messageNumber: 0,
+    },
+    isInitialized: true,
+    theirIdentityKey,
+    ourIdentityKey,
+    lastRemoteDHPublicKey: theirEphemeralKey,
+  };
+
+  await saveSession(chatId, session);
+  return session;
+}
+
+// ==================== Initial Key Exchange (Legacy — fallback) ====================
 
 export function sharedSecret(ourSecretKey: Uint8Array, theirPublicKey: Uint8Array): Uint8Array {
   return nacl.before(theirPublicKey, ourSecretKey);
@@ -188,7 +486,7 @@ export async function initializeSession(
   const rootKey = hkdf(shared, 'ssnote-root', 32);
   const chainKey = hkdf(shared, 'ssnote-chain', 32);
   const dhKeyPair = nacl.box.keyPair();
-  
+
   const session: SessionState = {
     ratchet: {
       dhKeyPair,
@@ -202,7 +500,7 @@ export async function initializeSession(
     ourIdentityKey,
     lastRemoteDHPublicKey: null,
   };
-  
+
   await saveSession(chatId, session);
   return session;
 }
@@ -601,6 +899,8 @@ interface SerializableSessionState {
   theirIdentityKey: string;
   ourIdentityKey: { publicKey: string; secretKey: string };
   lastRemoteDHPublicKey: string | null;
+  usedOtpId: string | null;
+  ephemeralPublicKey: string | null;
 }
 
 async function saveSession(chatId: string, session: SessionState) {
@@ -622,8 +922,10 @@ async function saveSession(chatId: string, session: SessionState) {
       secretKey: nacl.encodeBase64(session.ourIdentityKey.secretKey),
     },
     lastRemoteDHPublicKey: session.lastRemoteDHPublicKey ? nacl.encodeBase64(session.lastRemoteDHPublicKey) : null,
+    usedOtpId: session.usedOtpId || null,
+    ephemeralPublicKey: session.ephemeralPublicKey ? nacl.encodeBase64(session.ephemeralPublicKey) : null,
   };
-  
+
   await SecureStore.setItemAsync(
     `${SESSION_PREFIX}${chatId}`,
     JSON.stringify(serializable)
@@ -633,10 +935,10 @@ async function saveSession(chatId: string, session: SessionState) {
 async function loadSession(chatId: string): Promise<SessionState | null> {
   const stored = await SecureStore.getItemAsync(`${SESSION_PREFIX}${chatId}`);
   if (!stored) return null;
-  
+
   try {
     const s: SerializableSessionState = JSON.parse(stored);
-    
+
     return {
       ratchet: s.ratchet ? {
         dhKeyPair: s.ratchet.dhKeyPair ? {
@@ -655,6 +957,8 @@ async function loadSession(chatId: string): Promise<SessionState | null> {
         secretKey: nacl.decodeBase64(s.ourIdentityKey.secretKey),
       },
       lastRemoteDHPublicKey: s.lastRemoteDHPublicKey ? nacl.decodeBase64(s.lastRemoteDHPublicKey) : null,
+      usedOtpId: s.usedOtpId,
+      ephemeralPublicKey: s.ephemeralPublicKey ? nacl.decodeBase64(s.ephemeralPublicKey) : null,
     };
   } catch {
     return null;
