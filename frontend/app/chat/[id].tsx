@@ -1,11 +1,13 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   View, Text, TextInput, TouchableOpacity, StyleSheet, FlatList,
-  KeyboardAvoidingView, Platform, ActivityIndicator, Modal, ScrollView, Alert, PanResponder
+  KeyboardAvoidingView, Platform, ActivityIndicator, Modal, ScrollView, Alert, PanResponder, Image
 } from 'react-native';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
+import * as ImagePicker from 'expo-image-picker';
+import * as DocumentPicker from 'expo-document-picker';
 import { useAuth } from '../../src/context/AuthContext';
 import { messagesAPI, chatsAPI, typingAPI, contactsAPI, keysAPI, encryptedMessagesAPI } from '../../src/utils/api';
 import { COLORS, FONTS, SPACING, SECURITY_LEVELS } from '../../src/utils/theme';
@@ -45,6 +47,8 @@ export default function ChatDetailScreen() {
   const [e2eeFingerprint, setE2eeFingerprint] = useState<string | null>(null);
   const [showFingerprint, setShowFingerprint] = useState(false);
   const [isRecordingVoice, setIsRecordingVoice] = useState(false);
+  const [showMediaMenu, setShowMediaMenu] = useState(false);
+  const [pendingMedia, setPendingMedia] = useState<{ uri: string; base64: string; type: string; fileName?: string } | null>(null);
   const flatListRef = useRef<FlatList>(null);
   const typingTimer = useRef<any>(null);
   const lastMsgId = useRef<string | null>(null);
@@ -367,6 +371,141 @@ export default function ChatDetailScreen() {
     }
   };
 
+  const pickImage = async () => {
+    setShowMediaMenu(false);
+    const result = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ImagePicker.MediaTypeOptions.Images,
+      allowsEditing: false,
+      quality: 0.8,
+      base64: true,
+    });
+    if (!result.canceled && result.assets[0]) {
+      setPendingMedia({
+        uri: result.assets[0].uri,
+        base64: result.assets[0].base64 || '',
+        type: 'image',
+      });
+    }
+  };
+
+  const pickVideo = async () => {
+    setShowMediaMenu(false);
+    const result = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ImagePicker.MediaTypeOptions.Videos,
+      allowsEditing: false,
+      quality: 0.7,
+      base64: true,
+    });
+    if (!result.canceled && result.assets[0]) {
+      setPendingMedia({
+        uri: result.assets[0].uri,
+        base64: result.assets[0].base64 || '',
+        type: 'video',
+      });
+    }
+  };
+
+  const pickFile = async () => {
+    setShowMediaMenu(false);
+    const result = await DocumentPicker.getDocumentAsync({
+      copyToCacheDirectory: true,
+    });
+    if (!result.canceled && result.assets[0]) {
+      const file = result.assets[0];
+      const response = await fetch(file.uri);
+      const blob = await response.blob();
+      const reader = new FileReader();
+      reader.readAsDataURL(blob);
+      reader.onloadend = () => {
+        const base64 = (reader.result as string).split(',')[1];
+        setPendingMedia({
+          uri: file.uri,
+          base64,
+          type: 'file',
+          fileName: file.name,
+        });
+      };
+    }
+  };
+
+  const sendPendingMedia = async () => {
+    if (!pendingMedia || !id) return;
+    setSending(true);
+    try {
+      const mediaLabel = pendingMedia.type === 'image' ? '📷 Foto' :
+                         pendingMedia.type === 'video' ? '🎥 Video' :
+                         `📎 ${pendingMedia.fileName || 'Datei'}`;
+
+      if (e2eeSessionRef.current) {
+        if (chat?.is_group) {
+          const encrypted = await groupEncrypt(mediaLabel, id, pendingMedia.type, pendingMedia.base64);
+          if (encrypted) {
+            const res = await encryptedMessagesAPI.send({
+              chat_id: id,
+              ciphertext: encrypted.ciphertext,
+              nonce: encrypted.nonce,
+              sender_key_id: encrypted.senderKeyId,
+              sender_key_iteration: encrypted.iteration,
+              message_type: pendingMedia.type,
+              media_ciphertext: encrypted.mediaCiphertext,
+              media_nonce: encrypted.mediaNonce,
+              security_level: securityLevel,
+              self_destruct_seconds: selfDestruct,
+            });
+            const msg = res.data.message;
+            msg.content = mediaLabel;
+            msg.media_base64 = pendingMedia.base64;
+            msg._e2ee_sent = true;
+            setMessages(prev => [...prev, msg]);
+            lastMsgId.current = msg.id;
+          }
+        } else {
+          const encrypted = await ratchetEncrypt(mediaLabel, id, pendingMedia.type, pendingMedia.base64);
+          if (encrypted) {
+            const res = await encryptedMessagesAPI.send({
+              chat_id: id,
+              ciphertext: encrypted.ciphertext,
+              nonce: encrypted.nonce,
+              dh_public: encrypted.dhPublic,
+              msg_num: encrypted.msgNum,
+              message_type: pendingMedia.type,
+              media_ciphertext: encrypted.mediaCiphertext,
+              media_nonce: encrypted.mediaNonce,
+              security_level: securityLevel,
+              self_destruct_seconds: selfDestruct,
+            });
+            const msg = res.data.message;
+            msg.content = mediaLabel;
+            msg.media_base64 = pendingMedia.base64;
+            msg._e2ee_sent = true;
+            setMessages(prev => [...prev, msg]);
+            lastMsgId.current = msg.id;
+          }
+        }
+      } else {
+        const res = await messagesAPI.send({
+          chat_id: id,
+          content: mediaLabel,
+          message_type: pendingMedia.type,
+          media_base64: pendingMedia.base64,
+          security_level: securityLevel,
+          self_destruct_seconds: selfDestruct,
+        });
+        setMessages(prev => [...prev, res.data.message]);
+        lastMsgId.current = res.data.message.id;
+      }
+      setPendingMedia(null);
+    } catch (e) {
+      console.log('Error sending media', e);
+    } finally {
+      setSending(false);
+    }
+  };
+
+  const cancelPendingMedia = () => {
+    setPendingMedia(null);
+  };
+
   const handleTyping = () => {
     if (!id) return;
     if (typingTimer.current) clearTimeout(typingTimer.current);
@@ -547,12 +686,17 @@ export default function ChatDetailScreen() {
               />
             ) : hasMedia ? (
               <View style={styles.mediaContainer}>
-                <Ionicons name={getMediaIcon(item)} size={24} color={COLORS.primaryLight} />
-                <Text style={styles.mediaLabel}>{getMediaLabel(item)}</Text>
-                {item.media_base64 && item.message_type === 'image' && (
-                  <View style={styles.mediaPreview}>
-                    <Text style={styles.mediaPreviewText}>[Bild entschlüsselt]</Text>
-                  </View>
+                {item.message_type === 'image' && item.media_base64 ? (
+                  <Image
+                    source={{ uri: `data:image/jpeg;base64,${item.media_base64}` }}
+                    style={styles.msgImage}
+                    resizeMode="contain"
+                  />
+                ) : (
+                  <>
+                    <Ionicons name={getMediaIcon(item)} size={24} color={COLORS.primaryLight} />
+                    <Text style={styles.mediaLabel}>{getMediaLabel(item)}</Text>
+                  </>
                 )}
               </View>
             ) : null}
@@ -675,6 +819,55 @@ export default function ChatDetailScreen() {
           </View>
         )}
 
+        {/* Pending media preview */}
+        {pendingMedia && (
+          <View style={styles.mediaPreviewBar}>
+            {pendingMedia.type === 'image' ? (
+              <Image source={{ uri: pendingMedia.uri }} style={styles.mediaPreviewImage} />
+            ) : pendingMedia.type === 'video' ? (
+              <View style={styles.mediaPreviewFile}>
+                <Ionicons name="videocam" size={24} color={COLORS.primaryLight} />
+                <Text style={styles.mediaPreviewFileName}>Video</Text>
+              </View>
+            ) : (
+              <View style={styles.mediaPreviewFile}>
+                <Ionicons name="document" size={24} color={COLORS.primaryLight} />
+                <Text style={styles.mediaPreviewFileName}>{pendingMedia.fileName || 'Datei'}</Text>
+              </View>
+            )}
+            <View style={styles.mediaPreviewActions}>
+              <TouchableOpacity style={styles.mediaPreviewCancel} onPress={cancelPendingMedia}>
+                <Ionicons name="close" size={20} color={COLORS.danger} />
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.mediaPreviewSend} onPress={sendPendingMedia} disabled={sending}>
+                {sending ? <ActivityIndicator size="small" color={COLORS.white} /> : <Ionicons name="send" size={18} color={COLORS.white} />}
+              </TouchableOpacity>
+            </View>
+          </View>
+        )}
+
+        {/* Media picker menu */}
+        {showMediaMenu && (
+          <View style={styles.mediaMenu}>
+            <TouchableOpacity style={styles.mediaMenuItem} onPress={pickImage}>
+              <Ionicons name="image" size={24} color={COLORS.primaryLight} />
+              <Text style={styles.mediaMenuText}>Foto</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={styles.mediaMenuItem} onPress={pickVideo}>
+              <Ionicons name="videocam" size={24} color={COLORS.primaryLight} />
+              <Text style={styles.mediaMenuText}>Video</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={styles.mediaMenuItem} onPress={pickFile}>
+              <Ionicons name="document" size={24} color={COLORS.primaryLight} />
+              <Text style={styles.mediaMenuText}>Datei</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={styles.mediaMenuItem} onPress={() => setShowMediaMenu(false)}>
+              <Ionicons name="close" size={24} color={COLORS.textMuted} />
+              <Text style={styles.mediaMenuText}>Abbrechen</Text>
+            </TouchableOpacity>
+          </View>
+        )}
+
         {/* Input */}
         {isRecordingVoice ? (
           <VoiceRecorder
@@ -685,6 +878,9 @@ export default function ChatDetailScreen() {
           <View style={styles.inputBar}>
             <TouchableOpacity testID="security-menu-btn" onPress={() => setShowSecMenu(!showSecMenu)} style={styles.secBtn}>
               <Ionicons name="shield" size={20} color={getSecColor(securityLevel)} />
+            </TouchableOpacity>
+            <TouchableOpacity testID="attach-media-btn" onPress={() => setShowMediaMenu(!showMediaMenu)} style={styles.attachBtn}>
+              <Ionicons name="add" size={20} color={COLORS.textMuted} />
             </TouchableOpacity>
             <View style={styles.inputContainer}>
               <TextInput
@@ -990,7 +1186,8 @@ const styles = StyleSheet.create({
   algoText: { fontSize: FONTS.sizes.sm, color: COLORS.textPrimary },
 
   // Media
-  mediaContainer: { alignItems: 'center', justifyContent: 'center', padding: 12, marginBottom: 6, backgroundColor: 'rgba(0,0,0,0.2)', borderRadius: 12, borderWidth: 1, borderColor: COLORS.border },
+  msgImage: { width: 200, height: 200, borderRadius: 12, marginBottom: 4 },
+  mediaContainer: { alignItems: 'center', justifyContent: 'center', padding: 8, marginBottom: 6, backgroundColor: 'rgba(0,0,0,0.2)', borderRadius: 12, borderWidth: 1, borderColor: COLORS.border },
   mediaLabel: { fontSize: FONTS.sizes.xs, color: COLORS.primaryLight, marginTop: 6, fontWeight: FONTS.weights.medium },
   mediaPreview: { marginTop: 8, padding: 8, backgroundColor: COLORS.surfaceLight, borderRadius: 8 },
   mediaPreviewText: { fontSize: FONTS.sizes.xs, color: COLORS.textMuted },
@@ -1000,4 +1197,25 @@ const styles = StyleSheet.create({
     width: 40, height: 40, borderRadius: 20, backgroundColor: COLORS.primary,
     alignItems: 'center', justifyContent: 'center', marginLeft: 6,
   },
+  attachBtn: { padding: 10 },
+
+  // Media picker
+  mediaMenu: {
+    backgroundColor: COLORS.surface, borderTopWidth: 1, borderTopColor: COLORS.border,
+    flexDirection: 'row', justifyContent: 'space-around', paddingVertical: 12,
+  },
+  mediaMenuItem: { alignItems: 'center', gap: 4, padding: 8 },
+  mediaMenuText: { fontSize: FONTS.sizes.xs, color: COLORS.textSecondary },
+
+  // Pending media preview
+  mediaPreviewBar: {
+    flexDirection: 'row', alignItems: 'center', padding: 8, gap: 8,
+    backgroundColor: COLORS.surface, borderTopWidth: 1, borderTopColor: COLORS.border,
+  },
+  mediaPreviewImage: { width: 60, height: 60, borderRadius: 8, backgroundColor: COLORS.surfaceLight },
+  mediaPreviewFile: { flexDirection: 'row', alignItems: 'center', gap: 8, padding: 12, backgroundColor: COLORS.surfaceLight, borderRadius: 8 },
+  mediaPreviewFileName: { fontSize: FONTS.sizes.sm, color: COLORS.textPrimary },
+  mediaPreviewActions: { flexDirection: 'row', gap: 8, marginLeft: 'auto' },
+  mediaPreviewCancel: { padding: 8 },
+  mediaPreviewSend: { width: 36, height: 36, borderRadius: 18, backgroundColor: COLORS.primary, alignItems: 'center', justifyContent: 'center' },
 });
