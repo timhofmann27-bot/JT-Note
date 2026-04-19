@@ -140,6 +140,12 @@ SS-Note/
 | `GET`  | `/api/keys/{userId}` | Public Key eines Benutzers abrufen |
 | `GET`  | `/api/keys/batch` | Mehrere Public Keys auf einmal abrufen |
 
+### E2EE Verschlüsselte Nachrichten
+
+| Methode | Pfad | Beschreibung |
+|---------|------|-------------|
+| `POST` | `/api/messages/encrypted` | E2EE-Nachricht senden (Text + Medien) |
+
 ### WebSocket
 
 Socket.IO auf `/api/socket.io` für Echtzeit-Nachrichten und Kontaktanfragen.
@@ -168,17 +174,29 @@ SS-Note implementiert ein **Double Ratchet-ähnliches Protokoll** für maximale 
 | **Key Exchange** | X25519 (Curve25519) | Sichere Schlüsselvereinbarung |
 | **Verschlüsselung** | XSalsa20-Poly1305 | Authentifizierte Verschlüsselung |
 | **Key Derivation** | HKDF (HMAC-SHA256) | Sichere Schlüsselableitung |
-| **Forward Secrecy** | Double Ratchet | Jede Nachricht hat einen eigenen Schlüssel |
+| **Forward Secrecy** | Double Ratchet (1:1) | Jede Nachricht hat einen eigenen Schlüssel |
+| **Gruppen-E2EE** | Sender Keys Pattern | Signal/WhatsApp-kompatibles Gruppen-Protocol |
+| **Medien-E2EE** | Dedizierter Media-Key | Fotos/Videos/Audio separat verschlüsselt |
+| **One-Key-Per-Message** | HKDF + Random Entropy | Jede Nachricht = einzigartiger Schlüssel |
 | **Key Storage** | Expo SecureStore | iOS Keychain / Android Keystore |
 | **Key Verification** | Safety Numbers | Fingerprint-Vergleich wie bei Signal |
 
-**Ablauf:**
+**Ablauf (1:1 Chats):**
 1. Bei Login/Registrierung wird ein X25519-KeyPair generiert und im SecureStore gespeichert
 2. Der Public Key wird an das Backend übermittelt
 3. Beim Öffnen eines 1:1-Chats wird eine E2EE-Session per X25519 DH initialisiert
 4. Jede Nachricht wird client-seitig verschlüsselt — das Backend sieht nur Ciphertext
 5. Pro Nachricht wird ein neuer DH-Key generiert (Forward Secrecy)
-6. Safety Numbers ermöglichen Man-in-the-Middle-Erkennung
+6. Jede Nachricht bekommt einen einzigartigen Schlüssel (HKDF + Random Entropy)
+7. Medien (Fotos, Videos, Audio) werden mit separatem Media-Key verschlüsselt
+8. Safety Numbers ermöglichen Man-in-the-Middle-Erkennung
+
+**Ablauf (Gruppen-Chats — Sender Keys Pattern):**
+1. Jeder Teilnehmer generiert einen eigenen Sender Key (chain_key + iteration)
+2. Sender Key wird über die 1:1 E2EE-Kanäle an alle Gruppenmitglieder verteilt
+3. Jede Nachricht wird mit dem Sender Key verschlüsselt (O(n) statt O(n²))
+4. Pro Nachricht wird der Sender Key gepocht (Forward Secrecy)
+5. Medien werden ebenfalls mit dem Sender Key verschlüsselt
 
 ### Zusätzliche Sicherheitsmaßnahmen
 

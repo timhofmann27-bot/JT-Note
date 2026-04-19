@@ -14,10 +14,13 @@ import {
   getKeyFingerprint,
   getCombinedFingerprint,
   initializeSession,
+  initializeGroupSession,
+  groupEncrypt,
+  groupDecrypt,
   ratchetEncrypt,
   ratchetDecrypt,
   sharedSecret,
-} from '../../utils/crypto';
+} from '../../src/utils/crypto';
 import nacl from 'tweetnacl';
 
 export default function ChatDetailScreen() {
@@ -55,8 +58,35 @@ export default function ChatDetailScreen() {
       const decryptedMessages = [];
       for (const msg of (msgsRes.data.messages || [])) {
         if (msg.e2ee && msg.content && msg.nonce) {
-          const decrypted = await ratchetDecrypt(msg.content, msg.nonce, id, msg.dh_public || null);
-          decryptedMessages.push({ ...msg, content: decrypted || '[Entschlüsselung fehlgeschlagen]', _decrypted: true });
+          if (chatRes.data.chat?.is_group) {
+            const result = await groupDecrypt(
+              msg.content, msg.nonce, id,
+              msg.sender_id,
+              msg.sender_key_id || '',
+              msg.sender_key_iteration || 0,
+              msg.media_ciphertext || null,
+              msg.media_nonce || null
+            );
+            decryptedMessages.push({
+              ...msg,
+              content: result.text || '[Entschlüsselung fehlgeschlagen]',
+              media_base64: result.mediaBase64 || msg.media_base64,
+              _decrypted: true,
+            });
+          } else {
+            const result = await ratchetDecrypt(
+              msg.content, msg.nonce, id,
+              msg.dh_public || null,
+              msg.media_ciphertext || null,
+              msg.media_nonce || null
+            );
+            decryptedMessages.push({
+              ...msg,
+              content: result.text || '[Entschlüsselung fehlgeschlagen]',
+              media_base64: result.mediaBase64 || msg.media_base64,
+              _decrypted: true,
+            });
+          }
         } else {
           decryptedMessages.push(msg);
         }
@@ -72,9 +102,8 @@ export default function ChatDetailScreen() {
       }
       if (chatRes.data.chat?.is_group) {
         setGroupMembers(chatRes.data.chat.participants || []);
-      }
-      
-      if (!chatRes.data.chat?.is_group) {
+        await initGroupE2EESession(chatRes.data.chat);
+      } else {
         await initE2EESession(chatRes.data.chat);
       }
     } catch (e) {
@@ -108,6 +137,34 @@ export default function ChatDetailScreen() {
     }
   };
 
+  const initGroupE2EESession = async (chatData: any) => {
+    try {
+      const members = (chatData?.participants || [])
+        .filter((p: any) => p.id !== user?.id);
+      
+      const memberKeys: { userId: string; publicKey: Uint8Array }[] = [];
+      for (const member of members) {
+        try {
+          const keyRes = await keysAPI.get(member.id);
+          memberKeys.push({
+            userId: member.id,
+            publicKey: nacl.decodeBase64(keyRes.data.public_key),
+          });
+        } catch (e) {
+          console.log(`No public key for group member ${member.id}`);
+        }
+      }
+      
+      await initializeGroupSession(id!, memberKeys);
+      e2eeSessionRef.current = true;
+      setIsE2EESessionActive(true);
+    } catch (e) {
+      console.log('Group E2EE session init failed', e);
+      e2eeSessionRef.current = false;
+      setIsE2EESessionActive(false);
+    }
+  };
+
   useEffect(() => {
     if (!id) return;
     const interval = setInterval(async () => {
@@ -117,8 +174,35 @@ export default function ChatDetailScreen() {
           const newMsgs = [];
           for (const msg of res.data.messages) {
             if (msg.e2ee && msg.content && msg.nonce) {
-              const decrypted = await ratchetDecrypt(msg.content, msg.nonce, id, msg.dh_public || null);
-              newMsgs.push({ ...msg, content: decrypted || '[Entschlüsselung fehlgeschlagen]', _decrypted: true });
+              if (chat?.is_group) {
+                const result = await groupDecrypt(
+                  msg.content, msg.nonce, id,
+                  msg.sender_id,
+                  msg.sender_key_id || '',
+                  msg.sender_key_iteration || 0,
+                  msg.media_ciphertext || null,
+                  msg.media_nonce || null
+                );
+                newMsgs.push({
+                  ...msg,
+                  content: result.text || '[Entschlüsselung fehlgeschlagen]',
+                  media_base64: result.mediaBase64 || msg.media_base64,
+                  _decrypted: true,
+                });
+              } else {
+                const result = await ratchetDecrypt(
+                  msg.content, msg.nonce, id,
+                  msg.dh_public || null,
+                  msg.media_ciphertext || null,
+                  msg.media_nonce || null
+                );
+                newMsgs.push({
+                  ...msg,
+                  content: result.text || '[Entschlüsselung fehlgeschlagen]',
+                  media_base64: result.mediaBase64 || msg.media_base64,
+                  _decrypted: true,
+                });
+              }
             } else {
               newMsgs.push(msg);
             }
@@ -141,31 +225,55 @@ export default function ChatDetailScreen() {
       } catch {}
     }, 2000);
     return () => clearInterval(interval);
-  }, [id, user]);
+  }, [id, user, chat?.is_group]);
 
   const handleSend = async () => {
     if (!text.trim() || !id) return;
     setSending(true);
     try {
-      if (e2eeSessionRef.current && !chat?.is_group) {
-        const encrypted = await ratchetEncrypt(text.trim(), id);
-        if (encrypted) {
-          const res = await encryptedMessagesAPI.send({
-            chat_id: id,
-            ciphertext: encrypted.ciphertext,
-            nonce: encrypted.nonce,
-            dh_public: encrypted.dhPublic,
-            msg_num: encrypted.msgNum,
-            security_level: securityLevel,
-            self_destruct_seconds: selfDestruct,
-          });
-          const msg = res.data.message;
-          msg.content = text.trim();
-          msg._e2ee_sent = true;
-          setMessages(prev => [...prev, msg]);
-          lastMsgId.current = msg.id;
+      if (e2eeSessionRef.current) {
+        if (chat?.is_group) {
+          const encrypted = await groupEncrypt(text.trim(), id);
+          if (encrypted) {
+            const res = await encryptedMessagesAPI.send({
+              chat_id: id,
+              ciphertext: encrypted.ciphertext,
+              nonce: encrypted.nonce,
+              sender_key_id: encrypted.senderKeyId,
+              sender_key_iteration: encrypted.iteration,
+              security_level: securityLevel,
+              self_destruct_seconds: selfDestruct,
+            });
+            const msg = res.data.message;
+            msg.content = text.trim();
+            msg._e2ee_sent = true;
+            setMessages(prev => [...prev, msg]);
+            lastMsgId.current = msg.id;
+          } else {
+            throw new Error('Group encryption failed');
+          }
         } else {
-          throw new Error('Encryption failed');
+          const encrypted = await ratchetEncrypt(text.trim(), id);
+          if (encrypted) {
+            const res = await encryptedMessagesAPI.send({
+              chat_id: id,
+              ciphertext: encrypted.ciphertext,
+              nonce: encrypted.nonce,
+              dh_public: encrypted.dhPublic,
+              msg_num: encrypted.msgNum,
+              media_ciphertext: encrypted.mediaCiphertext,
+              media_nonce: encrypted.mediaNonce,
+              security_level: securityLevel,
+              self_destruct_seconds: selfDestruct,
+            });
+            const msg = res.data.message;
+            msg.content = text.trim();
+            msg._e2ee_sent = true;
+            setMessages(prev => [...prev, msg]);
+            lastMsgId.current = msg.id;
+          } else {
+            throw new Error('Encryption failed');
+          }
         }
       } else {
         const res = await messagesAPI.send({
@@ -291,6 +399,7 @@ export default function ChatDetailScreen() {
     const showSenderName = chat?.is_group && !isMine;
     const senderName = getSenderName(item);
     const senderColor = getSenderColor(item.sender_id);
+    const hasMedia = item.media_base64 || (item.e2ee && item.media_ciphertext);
 
     const showDate = index === 0 || (
       new Date(item.created_at).toDateString() !== new Date(messages[index - 1]?.created_at).toDateString()
@@ -299,6 +408,20 @@ export default function ChatDetailScreen() {
     const showNameSeparator = chat?.is_group && !isMine && index > 0 &&
       messages[index - 1]?.sender_id !== item.sender_id &&
       new Date(item.created_at).toDateString() === new Date(messages[index - 1]?.created_at).toDateString();
+
+    const getMediaIcon = (msg: any) => {
+      if (msg.message_type === 'image') return 'image';
+      if (msg.message_type === 'voice') return 'mic';
+      if (msg.message_type === 'file') return 'document';
+      return 'attach';
+    };
+
+    const getMediaLabel = (msg: any) => {
+      if (msg.message_type === 'image') return 'Verschlüsseltes Bild';
+      if (msg.message_type === 'voice') return 'Verschlüsselte Audio';
+      if (msg.message_type === 'file') return 'Verschlüsselte Datei';
+      return 'Verschlüsseltes Medium';
+    };
 
     return (
       <View>
@@ -341,9 +464,21 @@ export default function ChatDetailScreen() {
                 <Text style={[styles.msgSecText, { color: getSecColor(item.security_level) }]}>{item.security_level}</Text>
               </View>
             )}
+            {hasMedia && (
+              <View style={styles.mediaContainer}>
+                <Ionicons name={getMediaIcon(item)} size={24} color={COLORS.primaryLight} />
+                <Text style={styles.mediaLabel}>{getMediaLabel(item)}</Text>
+                {item.media_base64 && item.message_type === 'image' && (
+                  <View style={styles.mediaPreview}>
+                    <Text style={styles.mediaPreviewText}>[Bild entschlüsselt]</Text>
+                  </View>
+                )}
+              </View>
+            )}
             <Text style={styles.msgContent}>{item.content}</Text>
             <View style={styles.msgFooter}>
-              {item.encrypted && <Ionicons name="lock-closed" size={9} color={COLORS.textMuted} />}
+              {item.e2ee && <Ionicons name="lock-closed" size={9} color="#4CAF50" />}
+              {item.encrypted && !item.e2ee && <Ionicons name="lock-closed" size={9} color={COLORS.textMuted} />}
               {item.self_destruct_seconds && (
                 <View style={styles.destructBadge}>
                   <Ionicons name="timer" size={9} color={COLORS.restricted} />
@@ -755,4 +890,10 @@ const styles = StyleSheet.create({
   e2eeAlgoLabel: { fontSize: FONTS.sizes.xs, fontWeight: FONTS.weights.bold, color: COLORS.textMuted, letterSpacing: 2, marginBottom: 12 },
   algoItem: { flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 8 },
   algoText: { fontSize: FONTS.sizes.sm, color: COLORS.textPrimary },
+
+  // Media
+  mediaContainer: { alignItems: 'center', justifyContent: 'center', padding: 12, marginBottom: 6, backgroundColor: 'rgba(0,0,0,0.2)', borderRadius: 12, borderWidth: 1, borderColor: COLORS.border },
+  mediaLabel: { fontSize: FONTS.sizes.xs, color: COLORS.primaryLight, marginTop: 6, fontWeight: FONTS.weights.medium },
+  mediaPreview: { marginTop: 8, padding: 8, backgroundColor: COLORS.surfaceLight, borderRadius: 8 },
+  mediaPreviewText: { fontSize: FONTS.sizes.xs, color: COLORS.textMuted },
 });

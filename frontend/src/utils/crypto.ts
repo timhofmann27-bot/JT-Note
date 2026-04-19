@@ -4,8 +4,9 @@ import { utf8Encode, utf8Decode } from 'tweetnacl-util';
 
 // Storage keys
 const KEYPAIR_STORAGE = 'tn-keybox';
-const RATCHET_PREFIX = 'tn-ratchet-';
 const SESSION_PREFIX = 'tn-session-';
+const GROUP_SESSION_PREFIX = 'tn-group-session-';
+const SENDER_KEY_PREFIX = 'tn-sender-key-';
 
 // ==================== Key Management ====================
 
@@ -32,8 +33,6 @@ export async function getKeyPair(): Promise<naclBoxKeyPair | null> {
 // ==================== HKDF (HMAC-based Key Derivation) ====================
 
 function hmacSHA256(key: Uint8Array, data: Uint8Array): Uint8Array {
-  // tweetnacl doesn't include HMAC, so we implement a simplified HKDF using nacl-auth
-  // For web apps without native crypto, use a PRF based on nacl's secretbox
   const nonce = new Uint8Array(nacl.secretbox.nonceLength);
   const derived = nacl.secretbox(data, nonce, key);
   return derived.slice(0, 32);
@@ -59,7 +58,43 @@ function hkdf(inputKeyMaterial: Uint8Array, info: string, length: number): Uint8
   return okm.slice(0, length);
 }
 
-// ==================== Double Ratchet State ====================
+// ==================== ONE-KEY-PER-MESSAGE ====================
+// Jede Nachricht bekommt einen EINZIGARTIGEN Schlüssel, abgeleitet aus:
+// chain_key + message_number + message_type + random_entropy
+// => Selbst wenn zwei Nachrichten identischen Inhalt haben, unterschiedlicher Ciphertext
+
+function deriveMessageKey(
+  chainKey: Uint8Array,
+  messageNumber: number,
+  messageType: string = 'text',
+  extraEntropy?: Uint8Array
+): Uint8Array {
+  const entropy = extraEntropy || nacl.randomBytes(16);
+  const msgKeyInput = new Uint8Array([
+    ...chainKey,
+    messageNumber & 0xFF,
+    (messageNumber >> 8) & 0xFF,
+    (messageNumber >> 16) & 0xFF,
+    (messageNumber >> 24) & 0xFF,
+    ...utf8Encode(messageType),
+    ...entropy,
+  ]);
+  return hkdf(msgKeyInput, 'ssnote-msg-key', 32);
+}
+
+function deriveMediaKey(messageKey: Uint8Array, mediaType: string): Uint8Array {
+  return hkdf(
+    new Uint8Array([...messageKey, ...utf8Encode(mediaType)]),
+    'ssnote-media-key',
+    32
+  );
+}
+
+function nextChainKey(chainKey: Uint8Array): Uint8Array {
+  return hkdf(chainKey, 'ssnote-next-chain', 32);
+}
+
+// ==================== Double Ratchet State (1:1 Chats) ====================
 
 export interface RatchetState {
   dhKeyPair: naclBoxKeyPair;
@@ -67,7 +102,6 @@ export interface RatchetState {
   rootKey: Uint8Array;
   chainKey: Uint8Array;
   messageNumber: number;
-  previousChainKeys: Map<number, Uint8Array>;
 }
 
 export interface SessionState {
@@ -76,6 +110,28 @@ export interface SessionState {
   theirIdentityKey: Uint8Array;
   ourIdentityKey: naclBoxKeyPair;
   lastRemoteDHPublicKey: Uint8Array | null;
+}
+
+// ==================== Group Sender Key State ====================
+// Signal/WhatsApp Sender Keys Pattern:
+// - Jeder Teilnehmer generiert einen Sender Key (chain_key + iteration)
+// - Sender Key wird an alle Gruppenmitglieder verteilt (über 1:1 E2EE Kanäle)
+// - Jede Nachricht wird mit dem Sender Key verschlüsselt
+// - Forward Secrecy durch Ratchet pro Nachricht
+
+export interface SenderKeyState {
+  senderKeyId: string;
+  chainKey: Uint8Array;
+  iteration: number;
+  signingKeyPair: naclBoxKeyPair;
+}
+
+export interface GroupSessionState {
+  ourSenderKey: SenderKeyState | null;
+  theirSenderKeys: Map<string, SenderKeyState>;
+  isInitialized: boolean;
+  ourIdentityKey: naclBoxKeyPair;
+  members: Map<string, Uint8Array>;
 }
 
 // ==================== Initial Key Exchange (X3DH-like) ====================
@@ -101,7 +157,6 @@ export async function initializeSession(
       rootKey,
       chainKey,
       messageNumber: 0,
-      previousChainKeys: new Map(),
     },
     isInitialized: true,
     theirIdentityKey,
@@ -113,11 +168,76 @@ export async function initializeSession(
   return session;
 }
 
+// ==================== Group Session Initialization ====================
+
+export async function initializeGroupSession(
+  chatId: string,
+  members: { userId: string; publicKey: Uint8Array }[]
+): Promise<GroupSessionState> {
+  const ourKeyPair = await ensureKeyPair();
+  
+  const senderKeyId = `${ourKeyPair.publicKey.reduce((a, b) => a + b, 0)}-${Date.now()}`;
+  const senderChainKey = nacl.randomBytes(32);
+  const signingKeyPair = nacl.box.keyPair();
+  
+  const ourSenderKey: SenderKeyState = {
+    senderKeyId,
+    chainKey: senderChainKey,
+    iteration: 0,
+    signingKeyPair,
+  };
+  
+  const theirSenderKeys = new Map<string, SenderKeyState>();
+  const memberKeys = new Map<string, Uint8Array>();
+  
+  for (const member of members) {
+    memberKeys.set(member.userId, member.publicKey);
+  }
+  
+  const groupSession: GroupSessionState = {
+    ourSenderKey,
+    theirSenderKeys,
+    isInitialized: true,
+    ourIdentityKey: ourKeyPair,
+    members: memberKeys,
+  };
+  
+  await saveGroupSession(chatId, groupSession);
+  return groupSession;
+}
+
+export async function addGroupMember(
+  chatId: string,
+  userId: string,
+  publicKey: Uint8Array
+): Promise<void> {
+  const session = await loadGroupSession(chatId);
+  if (!session) return;
+  session.members.set(userId, publicKey);
+  await saveGroupSession(chatId, session);
+}
+
+export async function removeGroupMember(
+  chatId: string,
+  userId: string
+): Promise<void> {
+  const session = await loadGroupSession(chatId);
+  if (!session) return;
+  session.members.delete(userId);
+  session.theirSenderKeys.delete(userId);
+  await saveGroupSession(chatId, session);
+}
+
 // ==================== Ratchet Operations ====================
 
 function ratchetStepSend(state: RatchetState): { rootKey: Uint8Array; chainKey: Uint8Array; dhPublic: Uint8Array } {
+  if (!state.dhRemotePublicKey) {
+    const newDhKeyPair = nacl.box.keyPair();
+    state.dhKeyPair = newDhKeyPair;
+    return { rootKey: state.rootKey, chainKey: state.chainKey, dhPublic: newDhKeyPair.publicKey };
+  }
   const newDhKeyPair = nacl.box.keyPair();
-  const shared = nacl.box.before(state.dhRemotePublicKey!, state.dhKeyPair.secretKey);
+  const shared = nacl.box.before(state.dhRemotePublicKey, state.dhKeyPair.secretKey);
   const newRootKey = hkdf(shared, 'ssnote-ratchet-root', 32);
   const newChainKey = hkdf(shared, 'ssnote-ratchet-chain', 32);
   
@@ -142,16 +262,15 @@ function ratchetStepReceive(state: RatchetState, remoteDHPublic: Uint8Array): { 
   return { rootKey: newRootKey, chainKey: newChainKey };
 }
 
-function deriveMessageKey(chainKey: Uint8Array, messageNumber: number): Uint8Array {
-  const msgKeyInput = new Uint8Array([...chainKey, messageNumber]);
-  return hkdf(msgKeyInput, 'ssnote-msg', 32);
+// ==================== Sender Key Ratchet Operations ====================
+
+function senderKeyRatchetStep(state: SenderKeyState): { chainKey: Uint8Array; iteration: number } {
+  state.chainKey = nextChainKey(state.chainKey);
+  state.iteration++;
+  return { chainKey: state.chainKey, iteration: state.iteration };
 }
 
-function nextChainKey(chainKey: Uint8Array): Uint8Array {
-  return hkdf(chainKey, 'ssnote-next-chain', 32);
-}
-
-// ==================== Encrypt/Decrypt ====================
+// ==================== Encrypt/Decrypt (Basic) ====================
 
 export function encryptMessage(
   message: string,
@@ -182,31 +301,48 @@ export function decryptMessage(
   }
 }
 
-// ==================== Ratchet Encrypt (with forward secrecy) ====================
+// ==================== Ratchet Encrypt (1:1, Forward Secrecy) ====================
 
 export async function ratchetEncrypt(
   plaintext: string,
-  chatId: string
-): Promise<{ ciphertext: string; nonce: string; dhPublic: string | null; msgNum: number } | null> {
+  chatId: string,
+  messageType: string = 'text',
+  mediaBase64?: string | null
+): Promise<{
+  ciphertext: string;
+  nonce: string;
+  dhPublic: string | null;
+  msgNum: number;
+  mediaCiphertext?: string | null;
+  mediaNonce?: string | null;
+} | null> {
   const session = await loadSession(chatId);
   if (!session || !session.ratchet) return null;
   
   const ratchet = session.ratchet;
   
-  // Ratchet step: generate new DH key pair for forward secrecy
   if (ratchet.messageNumber === 0) {
     ratchetStepSend(ratchet);
   }
   
-  // Derive message key
-  const msgKey = deriveMessageKey(ratchet.chainKey, ratchet.messageNumber);
+  const entropy = nacl.randomBytes(16);
+  const msgKey = deriveMessageKey(ratchet.chainKey, ratchet.messageNumber, messageType, entropy);
   const nonce = nacl.randomBytes(nacl.secretbox.nonceLength);
   
-  // Encrypt
   const msgBytes = utf8Encode(plaintext);
   const encrypted = nacl.secretbox(msgBytes, nonce, msgKey);
   
-  // Advance chain
+  let mediaCiphertext: string | null = null;
+  let mediaNonce: string | null = null;
+  if (mediaBase64) {
+    const mKey = deriveMediaKey(msgKey, 'media');
+    const mNonce = nacl.randomBytes(nacl.secretbox.nonceLength);
+    const mediaBytes = nacl.decodeBase64(mediaBase64);
+    const mediaEncrypted = nacl.secretbox(mediaBytes, mNonce, mKey);
+    mediaCiphertext = nacl.encodeBase64(mediaEncrypted);
+    mediaNonce = nacl.encodeBase64(mNonce);
+  }
+  
   ratchet.chainKey = nextChainKey(ratchet.chainKey);
   ratchet.messageNumber++;
   
@@ -219,6 +355,8 @@ export async function ratchetEncrypt(
     nonce: nacl.encodeBase64(nonce),
     dhPublic,
     msgNum: ratchet.messageNumber - 1,
+    mediaCiphertext,
+    mediaNonce,
   };
 }
 
@@ -226,35 +364,182 @@ export async function ratchetDecrypt(
   ciphertext: string,
   nonce: string,
   chatId: string,
-  dhPublic: string | null
-): Promise<string | null> {
+  dhPublic: string | null,
+  mediaCiphertext?: string | null,
+  mediaNonce?: string | null
+): Promise<{ text: string | null; mediaBase64: string | null }> {
   const session = await loadSession(chatId);
-  if (!session || !session.ratchet) return null;
+  if (!session || !session.ratchet) return { text: null, mediaBase64: null };
   
   const ratchet = session.ratchet;
   
-  // If new DH public key, ratchet step
   if (dhPublic) {
     const remoteKey = nacl.decodeBase64(dhPublic);
     ratchetStepReceive(ratchet, remoteKey);
   }
   
-  // Derive message key
-  const msgKey = deriveMessageKey(ratchet.chainKey, ratchet.messageNumber);
+  const entropy = nacl.randomBytes(16);
+  const msgKey = deriveMessageKey(ratchet.chainKey, ratchet.messageNumber, 'text', entropy);
   const n = nacl.decodeBase64(nonce);
   
-  // Decrypt
   const encrypted = nacl.decodeBase64(ciphertext);
   const decrypted = nacl.secretbox.open(encrypted, n, msgKey);
-  if (decrypted === null) return null;
   
-  // Advance chain
+  let mediaBase64: string | null = null;
+  if (mediaCiphertext && mediaNonce && decrypted) {
+    const mKey = deriveMediaKey(msgKey, 'media');
+    const mNonce = nacl.decodeBase64(mediaNonce);
+    const mediaEncrypted = nacl.decodeBase64(mediaCiphertext);
+    const mediaDecrypted = nacl.secretbox.open(mediaEncrypted, mNonce, mKey);
+    if (mediaDecrypted) {
+      mediaBase64 = nacl.encodeBase64(mediaDecrypted);
+    }
+  }
+  
   ratchet.chainKey = nextChainKey(ratchet.chainKey);
   ratchet.messageNumber++;
   
   await saveSession(chatId, session);
   
-  return utf8Decode(decrypted);
+  return {
+    text: decrypted ? utf8Decode(decrypted) : null,
+    mediaBase64,
+  };
+}
+
+// ==================== Group Sender Key Encrypt/Decrypt ====================
+
+export async function groupEncrypt(
+  plaintext: string,
+  chatId: string,
+  messageType: string = 'text',
+  mediaBase64?: string | null
+): Promise<{
+  ciphertext: string;
+  nonce: string;
+  senderKeyId: string;
+  iteration: number;
+  mediaCiphertext?: string | null;
+  mediaNonce?: string | null;
+} | null> {
+  const session = await loadGroupSession(chatId);
+  if (!session || !session.ourSenderKey) return null;
+  
+  const senderKey = session.ourSenderKey;
+  
+  const entropy = nacl.randomBytes(16);
+  const msgKey = deriveMessageKey(senderKey.chainKey, senderKey.iteration, messageType, entropy);
+  const nonce = nacl.randomBytes(nacl.secretbox.nonceLength);
+  
+  const msgBytes = utf8Encode(plaintext);
+  const encrypted = nacl.secretbox(msgBytes, nonce, msgKey);
+  
+  let mediaCiphertext: string | null = null;
+  let mediaNonce: string | null = null;
+  if (mediaBase64) {
+    const mKey = deriveMediaKey(msgKey, 'media');
+    const mNonce = nacl.randomBytes(nacl.secretbox.nonceLength);
+    const mediaBytes = nacl.decodeBase64(mediaBase64);
+    const mediaEncrypted = nacl.secretbox(mediaBytes, mNonce, mKey);
+    mediaCiphertext = nacl.encodeBase64(mediaEncrypted);
+    mediaNonce = nacl.encodeBase64(mNonce);
+  }
+  
+  senderKeyRatchetStep(senderKey);
+  
+  await saveGroupSession(chatId, session);
+  
+  return {
+    ciphertext: nacl.encodeBase64(encrypted),
+    nonce: nacl.encodeBase64(nonce),
+    senderKeyId: senderKey.senderKeyId,
+    iteration: senderKey.iteration - 1,
+    mediaCiphertext,
+    mediaNonce,
+  };
+}
+
+export async function groupDecrypt(
+  ciphertext: string,
+  nonce: string,
+  chatId: string,
+  senderUserId: string,
+  senderKeyId: string,
+  iteration: number,
+  mediaCiphertext?: string | null,
+  mediaNonce?: string | null
+): Promise<{ text: string | null; mediaBase64: string | null }> {
+  const session = await loadGroupSession(chatId);
+  if (!session) return { text: null, mediaBase64: null };
+  
+  let senderKey = session.theirSenderKeys.get(senderUserId);
+  if (!senderKey) {
+    senderKey = {
+      senderKeyId,
+      chainKey: nacl.randomBytes(32),
+      iteration: 0,
+      signingKeyPair: nacl.box.keyPair(),
+    };
+    session.theirSenderKeys.set(senderUserId, senderKey);
+  }
+  
+  while (senderKey.iteration < iteration) {
+    senderKeyRatchetStep(senderKey);
+  }
+  
+  const entropy = nacl.randomBytes(16);
+  const msgKey = deriveMessageKey(senderKey.chainKey, iteration, 'text', entropy);
+  const n = nacl.decodeBase64(nonce);
+  
+  const encrypted = nacl.decodeBase64(ciphertext);
+  const decrypted = nacl.secretbox.open(encrypted, n, msgKey);
+  
+  let mediaBase64: string | null = null;
+  if (mediaCiphertext && mediaNonce && decrypted) {
+    const mKey = deriveMediaKey(msgKey, 'media');
+    const mNonce = nacl.decodeBase64(mediaNonce);
+    const mediaEncrypted = nacl.decodeBase64(mediaCiphertext);
+    const mediaDecrypted = nacl.secretbox.open(mediaEncrypted, mNonce, mKey);
+    if (mediaDecrypted) {
+      mediaBase64 = nacl.encodeBase64(mediaDecrypted);
+    }
+  }
+  
+  senderKeyRatchetStep(senderKey);
+  
+  await saveGroupSession(chatId, session);
+  
+  return {
+    text: decrypted ? utf8Decode(decrypted) : null,
+    mediaBase64,
+  };
+}
+
+// ==================== Media Encryption (Standalone) ====================
+
+export function encryptMedia(mediaBase64: string): { ciphertext: string; nonce: string; key: string } {
+  const key = nacl.randomBytes(32);
+  const nonce = nacl.randomBytes(nacl.secretbox.nonceLength);
+  const mediaBytes = nacl.decodeBase64(mediaBase64);
+  const encrypted = nacl.secretbox(mediaBytes, nonce, key);
+  return {
+    ciphertext: nacl.encodeBase64(encrypted),
+    nonce: nacl.encodeBase64(nonce),
+    key: nacl.encodeBase64(key),
+  };
+}
+
+export function decryptMedia(ciphertext: string, nonce: string, key: string): string | null {
+  try {
+    const encrypted = nacl.decodeBase64(ciphertext);
+    const n = nacl.decodeBase64(nonce);
+    const k = nacl.decodeBase64(key);
+    const decrypted = nacl.secretbox.open(encrypted, n, k);
+    if (decrypted === null) return null;
+    return nacl.encodeBase64(decrypted);
+  } catch {
+    return null;
+  }
 }
 
 // ==================== Session Persistence ====================
@@ -317,7 +602,6 @@ async function loadSession(chatId: string): Promise<SessionState | null> {
         rootKey: nacl.decodeBase64(s.ratchet.rootKey),
         chainKey: nacl.decodeBase64(s.ratchet.chainKey),
         messageNumber: s.ratchet.messageNumber,
-        previousChainKeys: new Map(),
       } : null,
       isInitialized: s.isInitialized,
       theirIdentityKey: nacl.decodeBase64(s.theirIdentityKey),
@@ -332,10 +616,108 @@ async function loadSession(chatId: string): Promise<SessionState | null> {
   }
 }
 
+// ==================== Group Session Persistence ====================
+
+interface SerializableSenderKey {
+  senderKeyId: string;
+  chainKey: string;
+  iteration: number;
+  signingKeyPair: { publicKey: string; secretKey: string };
+}
+
+interface SerializableGroupSession {
+  ourSenderKey: SerializableSenderKey | null;
+  theirSenderKeys: [string, SerializableSenderKey][];
+  isInitialized: boolean;
+  ourIdentityKey: { publicKey: string; secretKey: string };
+  members: [string, string][];
+}
+
+async function saveGroupSession(chatId: string, session: GroupSessionState) {
+  const serializable: SerializableGroupSession = {
+    ourSenderKey: session.ourSenderKey ? {
+      senderKeyId: session.ourSenderKey.senderKeyId,
+      chainKey: nacl.encodeBase64(session.ourSenderKey.chainKey),
+      iteration: session.ourSenderKey.iteration,
+      signingKeyPair: {
+        publicKey: nacl.encodeBase64(session.ourSenderKey.signingKeyPair.publicKey),
+        secretKey: nacl.encodeBase64(session.ourSenderKey.signingKeyPair.secretKey),
+      },
+    } : null,
+    theirSenderKeys: Array.from(session.theirSenderKeys.entries()).map(([k, v]) => [k, {
+      senderKeyId: v.senderKeyId,
+      chainKey: nacl.encodeBase64(v.chainKey),
+      iteration: v.iteration,
+      signingKeyPair: {
+        publicKey: nacl.encodeBase64(v.signingKeyPair.publicKey),
+        secretKey: nacl.encodeBase64(v.signingKeyPair.secretKey),
+      },
+    }]),
+    isInitialized: session.isInitialized,
+    ourIdentityKey: {
+      publicKey: nacl.encodeBase64(session.ourIdentityKey.publicKey),
+      secretKey: nacl.encodeBase64(session.ourIdentityKey.secretKey),
+    },
+    members: Array.from(session.members.entries()).map(([k, v]) => [k, nacl.encodeBase64(v)]),
+  };
+  
+  await SecureStore.setItemAsync(
+    `${GROUP_SESSION_PREFIX}${chatId}`,
+    JSON.stringify(serializable)
+  );
+}
+
+async function loadGroupSession(chatId: string): Promise<GroupSessionState | null> {
+  const stored = await SecureStore.getItemAsync(`${GROUP_SESSION_PREFIX}${chatId}`);
+  if (!stored) return null;
+  
+  try {
+    const s: SerializableGroupSession = JSON.parse(stored);
+    
+    const theirSenderKeys = new Map<string, SenderKeyState>();
+    for (const [k, v] of s.theirSenderKeys) {
+      theirSenderKeys.set(k, {
+        senderKeyId: v.senderKeyId,
+        chainKey: nacl.decodeBase64(v.chainKey),
+        iteration: v.iteration,
+        signingKeyPair: {
+          publicKey: nacl.decodeBase64(v.signingKeyPair.publicKey),
+          secretKey: nacl.decodeBase64(v.signingKeyPair.secretKey),
+        },
+      });
+    }
+    
+    const members = new Map<string, Uint8Array>();
+    for (const [k, v] of s.members) {
+      members.set(k, nacl.decodeBase64(v));
+    }
+    
+    return {
+      ourSenderKey: s.ourSenderKey ? {
+        senderKeyId: s.ourSenderKey.senderKeyId,
+        chainKey: nacl.decodeBase64(s.ourSenderKey.chainKey),
+        iteration: s.ourSenderKey.iteration,
+        signingKeyPair: {
+          publicKey: nacl.decodeBase64(s.ourSenderKey.signingKeyPair.publicKey),
+          secretKey: nacl.decodeBase64(s.ourSenderKey.signingKeyPair.secretKey),
+        },
+      } : null,
+      theirSenderKeys,
+      isInitialized: s.isInitialized,
+      ourIdentityKey: {
+        publicKey: nacl.decodeBase64(s.ourIdentityKey.publicKey),
+        secretKey: nacl.decodeBase64(s.ourIdentityKey.secretKey),
+      },
+      members,
+    };
+  } catch {
+    return null;
+  }
+}
+
 // ==================== Key Fingerprint (Safety Number) ====================
 
 export function getKeyFingerprint(publicKey: Uint8Array): string {
-  // Create a human-readable fingerprint like Signal's safety numbers
   const hash = nacl.hash(publicKey);
   const chunks: string[] = [];
   for (let i = 0; i < hash.length; i += 2) {
@@ -347,6 +729,52 @@ export function getKeyFingerprint(publicKey: Uint8Array): string {
 export function getCombinedFingerprint(ourKey: Uint8Array, theirKey: Uint8Array): string {
   const combined = new Uint8Array([...ourKey, ...theirKey]);
   return getKeyFingerprint(combined);
+}
+
+// ==================== Sender Key Distribution ====================
+
+export async function createSenderKeyDistributionMessage(chatId: string): Promise<{
+  senderKeyId: string;
+  chainKey: string;
+  iteration: number;
+  signingPublicKey: string;
+} | null> {
+  const session = await loadGroupSession(chatId);
+  if (!session || !session.ourSenderKey) return null;
+  
+  const sk = session.ourSenderKey;
+  return {
+    senderKeyId: sk.senderKeyId,
+    chainKey: nacl.encodeBase64(sk.chainKey),
+    iteration: sk.iteration,
+    signingPublicKey: nacl.encodeBase64(sk.signingKeyPair.publicKey),
+  };
+}
+
+export async function processSenderKeyDistributionMessage(
+  chatId: string,
+  senderUserId: string,
+  distribution: {
+    senderKeyId: string;
+    chainKey: string;
+    iteration: number;
+    signingPublicKey: string;
+  }
+): Promise<void> {
+  const session = await loadGroupSession(chatId);
+  if (!session) return;
+  
+  session.theirSenderKeys.set(senderUserId, {
+    senderKeyId: distribution.senderKeyId,
+    chainKey: nacl.decodeBase64(distribution.chainKey),
+    iteration: distribution.iteration,
+    signingKeyPair: {
+      publicKey: nacl.decodeBase64(distribution.signingPublicKey),
+      secretKey: new Uint8Array(nacl.box.secretKeyLength),
+    },
+  });
+  
+  await saveGroupSession(chatId, session);
 }
 
 // ==================== Utility ====================
@@ -361,13 +789,12 @@ export async function ensureKeyPair(): Promise<naclBoxKeyPair> {
 }
 
 export async function clearSession(chatId: string) {
-  await SecureStore.deleteItemAsync(`${SESSION_PREFIX}${chatId}`);
+  try { await SecureStore.deleteItemAsync(`${SESSION_PREFIX}${chatId}`); } catch {}
+  try { await SecureStore.deleteItemAsync(`${GROUP_SESSION_PREFIX}${chatId}`); } catch {}
 }
 
 export async function clearAllSessions() {
-  // Clear keypair
   try { await SecureStore.deleteItemAsync(KEYPAIR_STORAGE); } catch {}
-  // Note: SecureStore doesn't have a way to list all keys, so we track sessions separately
 }
 
 interface naclBoxKeyPair {

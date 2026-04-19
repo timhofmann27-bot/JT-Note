@@ -282,7 +282,7 @@ class PublicKeyUpload(BaseModel):
 
 class EncryptedMessageSend(BaseModel):
     chat_id: str
-    ciphertext: str = Field(min_length=1, max_length=50000)
+    ciphertext: str = Field(min_length=1, max_length=500000)
     nonce: str = Field(min_length=1, max_length=100)
     dh_public: Optional[str] = Field(default=None, max_length=100)
     msg_num: int = 0
@@ -290,6 +290,10 @@ class EncryptedMessageSend(BaseModel):
     security_level: str = "UNCLASSIFIED"
     self_destruct_seconds: Optional[int] = Field(default=None, ge=5, le=604800)
     is_emergency: bool = False
+    media_ciphertext: Optional[str] = Field(default=None, max_length=10000000)
+    media_nonce: Optional[str] = Field(default=None, max_length=100)
+    sender_key_id: Optional[str] = Field(default=None, max_length=200)
+    sender_key_iteration: Optional[int] = Field(default=None)
     @field_validator('security_level')
     @classmethod
     def validate_sec(cls, v: str) -> str:
@@ -1150,13 +1154,16 @@ async def get_user_keys_batch(user_ids: str, user: dict = Depends(get_current_us
 
 @api_router.post("/messages/encrypted")
 async def send_encrypted_message(input: EncryptedMessageSend, user: dict = Depends(get_current_user)):
-    """Send an E2EE encrypted message. Backend only sees ciphertext."""
+    """Send an E2EE encrypted message. Backend only sees ciphertext. Supports 1:1 and group chats."""
     chat = await db.chats.find_one({"_id": ObjectId(input.chat_id), "participant_ids": ObjectId(user["id"])})
     if not chat:
         raise HTTPException(status_code=404, detail="Chat nicht gefunden")
     
     if not BASE64_REGEX.match(input.ciphertext) or not BASE64_REGEX.match(input.nonce):
         raise HTTPException(status_code=400, detail="Ungültige verschlüsselte Daten")
+    
+    if input.media_ciphertext and not BASE64_REGEX.match(input.media_ciphertext):
+        raise HTTPException(status_code=400, detail="Ungültige verschlüsselte Medien-Daten")
     
     now = datetime.now(timezone.utc)
     msg_doc = {
@@ -1173,6 +1180,10 @@ async def send_encrypted_message(input: EncryptedMessageSend, user: dict = Depen
         "self_destruct_seconds": input.self_destruct_seconds,
         "self_destruct_at": (now + timedelta(seconds=input.self_destruct_seconds)) if input.self_destruct_seconds else None,
         "is_emergency": input.is_emergency,
+        "media_ciphertext": input.media_ciphertext,
+        "media_nonce": input.media_nonce,
+        "sender_key_id": input.sender_key_id,
+        "sender_key_iteration": input.sender_key_iteration,
         "status": "sent",
         "delivered_to": [],
         "read_by": [user["id"]],

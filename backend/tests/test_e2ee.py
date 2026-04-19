@@ -111,6 +111,78 @@ class TestE2EEEncryptedMessages:
         assert data["message"]["e2ee"] is True
         assert data["message"]["content"] == "ZW5jcnlwdGVkY29udGVudA=="
 
+    def test_encrypted_message_with_media(self, api_client, base_url):
+        """Test sending an encrypted message with encrypted media attachment"""
+        unique_id = secrets.token_hex(4)
+        user_data = {
+            "username": f"enc-media-{unique_id}",
+            "passkey": "TestPass123!",
+            "name": "Media Enc User",
+        }
+        reg = api_client.post(f"{base_url}/api/auth/register", json=user_data)
+        assert reg.status_code == 200
+        token = reg.json()["token"]
+        api_client.headers["Authorization"] = f"Bearer {token}"
+
+        chat_resp = api_client.post(f"{base_url}/api/chats", json={
+            "participant_ids": [],
+            "is_group": False,
+        })
+        chat_id = chat_resp.json()["chat"]["id"]
+
+        resp = api_client.post(f"{base_url}/api/messages/encrypted", json={
+            "chat_id": chat_id,
+            "ciphertext": "ZW5jcnlwdGVkY29udGVudA==",
+            "nonce": "bm9uY2V2YWx1ZQ==",
+            "dh_public": "ZGhwdWJsaWNrZXk=",
+            "msg_num": 0,
+            "message_type": "image",
+            "media_ciphertext": "ZW5jcnlwdGVkSW1hZ2VEYXRh",
+            "media_nonce": "bWVkaWFub25jZQ==",
+        })
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["message"]["encrypted"] is True
+        assert data["message"]["e2ee"] is True
+        assert data["message"]["media_ciphertext"] == "ZW5jcnlwdGVkSW1hZ2VEYXRh"
+        assert data["message"]["media_nonce"] == "bWVkaWFub25jZQ=="
+        assert data["message"]["message_type"] == "image"
+
+    def test_encrypted_group_message_with_sender_key(self, api_client, base_url):
+        """Test sending an encrypted group message with sender key info"""
+        unique_id = secrets.token_hex(4)
+        user_data = {
+            "username": f"enc-group-{unique_id}",
+            "passkey": "TestPass123!",
+            "name": "Group Enc User",
+        }
+        reg = api_client.post(f"{base_url}/api/auth/register", json=user_data)
+        assert reg.status_code == 200
+        token = reg.json()["token"]
+        api_client.headers["Authorization"] = f"Bearer {token}"
+
+        chat_resp = api_client.post(f"{base_url}/api/chats", json={
+            "participant_ids": [],
+            "is_group": True,
+            "name": "Test Group",
+        })
+        chat_id = chat_resp.json()["chat"]["id"]
+
+        resp = api_client.post(f"{base_url}/api/messages/encrypted", json={
+            "chat_id": chat_id,
+            "ciphertext": "Z3JvdXBFbmNyeXB0ZWQ=",
+            "nonce": "Z3JvdXBub25jZQ==",
+            "sender_key_id": "sender-key-12345",
+            "sender_key_iteration": 5,
+            "message_type": "text",
+        })
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["message"]["encrypted"] is True
+        assert data["message"]["e2ee"] is True
+        assert data["message"]["sender_key_id"] == "sender-key-12345"
+        assert data["message"]["sender_key_iteration"] == 5
+
     def test_encrypted_message_requires_chat_access(self, api_client, base_url):
         """Test that sending encrypted message to a chat you're not in fails"""
         unique_id = secrets.token_hex(4)
@@ -158,13 +230,40 @@ class TestE2EEEncryptedMessages:
         })
         assert resp.status_code == 400
 
-    def test_get_messages_returns_encrypted_content(self, api_client, base_url):
-        """Test that GET /messages returns ciphertext for E2EE messages"""
+    def test_invalid_media_base64_rejected(self, api_client, base_url):
+        """Test that invalid base64 in media ciphertext is rejected"""
         unique_id = secrets.token_hex(4)
         user_data = {
             "username": f"enc-user4-{unique_id}",
             "passkey": "TestPass123!",
             "name": "Enc User 4",
+        }
+        reg = api_client.post(f"{base_url}/api/auth/register", json=user_data)
+        assert reg.status_code == 200
+        token = reg.json()["token"]
+        api_client.headers["Authorization"] = f"Bearer {token}"
+
+        chat_resp = api_client.post(f"{base_url}/api/chats", json={
+            "participant_ids": [],
+            "is_group": False,
+        })
+        chat_id = chat_resp.json()["chat"]["id"]
+
+        resp = api_client.post(f"{base_url}/api/messages/encrypted", json={
+            "chat_id": chat_id,
+            "ciphertext": "dmFsaWRjaXBoZXI=",
+            "nonce": "bm9uY2U=",
+            "media_ciphertext": "!!!invalid!!!",
+        })
+        assert resp.status_code == 400
+
+    def test_get_messages_returns_encrypted_content(self, api_client, base_url):
+        """Test that GET /messages returns ciphertext for E2EE messages"""
+        unique_id = secrets.token_hex(4)
+        user_data = {
+            "username": f"enc-user5-{unique_id}",
+            "passkey": "TestPass123!",
+            "name": "Enc User 5",
         }
         reg = api_client.post(f"{base_url}/api/auth/register", json=user_data)
         assert reg.status_code == 200
@@ -191,3 +290,4 @@ class TestE2EEEncryptedMessages:
         assert len(messages) >= 1
         assert messages[0]["e2ee"] is True
         assert messages[0]["encrypted"] is True
+
