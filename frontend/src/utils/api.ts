@@ -112,6 +112,12 @@ export const keysAPI = {
   getBatch: (userIds: string[]) => api.get('/keys/batch', { params: { user_ids: userIds.join(',') } }),
 };
 
+export const pushAPI = {
+  register: (pushToken: string, platform: string = 'expo') =>
+    api.post('/push/register', { push_token: pushToken, platform }),
+  unregister: () => api.delete('/push/unregister'),
+};
+
 export const encryptedMessagesAPI = {
   send: (data: {
     chat_id: string;

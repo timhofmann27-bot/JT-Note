@@ -280,6 +280,10 @@ class PublicKeyUpload(BaseModel):
     public_key: str = Field(min_length=10, max_length=100)
     fingerprint: Optional[str] = Field(default=None, max_length=100)
 
+class PushTokenUpload(BaseModel):
+    push_token: str = Field(min_length=10, max_length=500)
+    platform: str = "expo"
+
 class EncryptedMessageSend(BaseModel):
     chat_id: str
     ciphertext: str = Field(min_length=1, max_length=500000)
@@ -1150,6 +1154,71 @@ async def get_user_keys_batch(user_ids: str, user: dict = Depends(get_current_us
         }
     return {"keys": result}
 
+# ==================== PUSH NOTIFICATIONS (E2EE-safe) ====================
+
+@api_router.post("/push/register")
+async def register_push_token(input: PushTokenUpload, request: Request, user: dict = Depends(get_current_user)):
+    """Register device push token for E2EE notifications. Server never sees message content."""
+    await db.push_tokens.update_one(
+        {"user_id": user["id"], "platform": input.platform},
+        {"$set": {
+            "push_token": input.push_token,
+            "platform": input.platform,
+            "registered_at": datetime.now(timezone.utc),
+            "last_used": None,
+        }},
+        upsert=True
+    )
+    await audit_log("push_registered", user["id"], request.client.host if request.client else "unknown", {"platform": input.platform})
+    return {"message": "Push-Token registriert"}
+
+@api_router.delete("/push/unregister")
+async def unregister_push_token(request: Request, user: dict = Depends(get_current_user)):
+    """Remove push token for current device"""
+    await db.push_tokens.delete_many({"user_id": user["id"]})
+    await audit_log("push_unregistered", user["id"], request.client.host if request.client else "unknown")
+    return {"message": "Push-Token entfernt"}
+
+async def send_push_notification(user_id: str, chat_name: str = None):
+    """Send E2EE-safe push notification. Never includes message content."""
+    tokens = await db.push_tokens.find({"user_id": user_id}).to_list(10)
+    if not tokens:
+        return
+    
+    # E2EE-safe: Only notify that a new encrypted message arrived
+    # NEVER include message content, sender name, or any metadata
+    notification = {
+        "to": [],
+        "title": "SS-Note",
+        "body": "Neue verschlüsselte Nachricht",
+        "data": {
+            "type": "encrypted_message",
+            "chat_id": chat_name,
+        },
+        "sound": "default",
+        "priority": "high",
+    }
+    
+    for t in tokens:
+        notification["to"].append(t["push_token"])
+    
+    # Send via Expo Push API (works for both iOS and Android via Expo)
+    try:
+        import httpx
+        async with httpx.AsyncClient() as http:
+            resp = await http.post(
+                "https://exp.host/--/api/v2/push/send",
+                json=notification,
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                await db.push_tokens.update_many(
+                    {"user_id": user_id},
+                    {"$set": {"last_used": datetime.now(timezone.utc)}}
+                )
+    except Exception as e:
+        logger.warning(f"Push notification failed: {e}")
+
 # ==================== E2EE: ENCRYPTED MESSAGES ====================
 
 @api_router.post("/messages/encrypted")
@@ -1197,6 +1266,11 @@ async def send_encrypted_message(input: EncryptedMessageSend, user: dict = Depen
     
     await ws_emit_to_chat(input.chat_id, 'message:new', serialized)
     
+    # Push notification for offline participants (E2EE-safe: no content)
+    other_participants = [pid for pid in chat.get("participant_ids", []) if str(pid) != user["id"]]
+    for pid in other_participants:
+        await send_push_notification(str(pid), input.chat_id)
+    
     return {"message": serialized}
 
 # ==================== STARTUP ====================
@@ -1220,6 +1294,7 @@ async def startup():
     await db.magic_tokens.create_index("token")
     await db.magic_tokens.create_index("expires_at", expireAfterSeconds=0)
     await db.user_keys.create_index("user_id", unique=True)
+    await db.push_tokens.create_index([("user_id", 1), ("platform", 1)])
     
     # Seed anonymous demo users
     for udata in [
