@@ -96,6 +96,9 @@ export const chatsAPI = {
   pinMessage: (id: string, messageId: string) => api.post(`/chats/${id}/pin-message`, { message_id: messageId }),
   unpinMessage: (id: string) => api.post(`/chats/${id}/unpin-message`),
   export: (id: string) => api.post(`/chats/${id}/export`),
+  promoteAdmin: (id: string, memberId: string) => api.post(`/chats/${id}/promote-admin`, { member_id: memberId }),
+  demoteAdmin: (id: string, memberId: string) => api.post(`/chats/${id}/demote-admin`, { member_id: memberId }),
+  getAdmins: (id: string) => api.get(`/chats/${id}/admins`),
 };
 
 export const messagesAPI = {

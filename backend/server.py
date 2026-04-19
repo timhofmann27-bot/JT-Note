@@ -795,7 +795,7 @@ async def create_chat(input: ChatCreate, user: dict = Depends(get_current_user))
         existing = await db.chats.find_one({"is_group": False, "participant_ids": {"$all": [ObjectId(p) for p in all_participants], "$size": 2}})
         if existing:
             return {"chat": serialize_chat(existing)}
-    chat_doc = {"name": input.name, "is_group": input.is_group, "participant_ids": [ObjectId(p) for p in all_participants], "created_by": ObjectId(user["id"]), "security_level": input.security_level, "group_role_map": input.group_role_map or {}, "created_at": datetime.now(timezone.utc), "last_message": None, "last_message_at": datetime.now(timezone.utc)}
+    chat_doc = {"name": input.name, "is_group": input.is_group, "participant_ids": [ObjectId(p) for p in all_participants], "created_by": ObjectId(user["id"]), "admin_ids": [user["id"]], "security_level": input.security_level, "group_role_map": input.group_role_map or {}, "created_at": datetime.now(timezone.utc), "last_message": None, "last_message_at": datetime.now(timezone.utc)}
     result = await db.chats.insert_one(chat_doc)
     chat_doc["_id"] = result.inserted_id
     return {"chat": serialize_chat(chat_doc)}
@@ -878,8 +878,8 @@ async def remove_group_member(chat_id: str, request: Request, user: dict = Depen
     chat = await db.chats.find_one({"_id": oid})
     if not chat:
         raise HTTPException(status_code=404, detail="Chat nicht gefunden")
-    if str(chat.get("created_by")) != user["id"]:
-        raise HTTPException(status_code=403, detail="Nur der Ersteller kann Mitglieder entfernen")
+    if str(chat.get("created_by")) != user["id"] and user["id"] not in chat.get("admin_ids", []):
+        raise HTTPException(status_code=403, detail="Nur Admins können Mitglieder entfernen")
     body = await request.json()
     member_id = body.get("member_id")
     if not member_id:
@@ -890,6 +890,61 @@ async def remove_group_member(chat_id: str, request: Request, user: dict = Depen
     await ws_emit_to_chat(chat_id, 'chat:member_removed', {'user_id': user["id"], 'removed_id': member_id, 'chat_id': chat_id})
     return {"message": "Mitglied entfernt"}
 
+@api_router.post("/chats/{chat_id}/promote-admin")
+async def promote_admin(chat_id: str, request: Request, user: dict = Depends(get_current_user)):
+    """Promote a member to admin (creator only)"""
+    oid = validate_object_id(chat_id)
+    chat = await db.chats.find_one({"_id": oid})
+    if not chat:
+        raise HTTPException(status_code=404, detail="Chat nicht gefunden")
+    if str(chat.get("created_by")) != user["id"]:
+        raise HTTPException(status_code=403, detail="Nur der Ersteller kann Admins ernennen")
+    body = await request.json()
+    member_id = body.get("member_id")
+    if not member_id:
+        raise HTTPException(status_code=400, detail="member_id erforderlich")
+    if member_id not in [str(p) for p in chat.get("participant_ids", [])]:
+        raise HTTPException(status_code=400, detail="Nur Mitglieder können Admin werden")
+    await db.chats.update_one({"_id": oid}, {"$addToSet": {"admin_ids": member_id}})
+    await ws_emit_to_chat(chat_id, 'chat:admin_promoted', {'user_id': user["id"], 'admin_id': member_id})
+    return {"message": "Admin ernannt"}
+
+@api_router.post("/chats/{chat_id}/demote-admin")
+async def demote_admin(chat_id: str, request: Request, user: dict = Depends(get_current_user)):
+    """Demote an admin to member (creator only)"""
+    oid = validate_object_id(chat_id)
+    chat = await db.chats.find_one({"_id": oid})
+    if not chat:
+        raise HTTPException(status_code=404, detail="Chat nicht gefunden")
+    if str(chat.get("created_by")) != user["id"]:
+        raise HTTPException(status_code=403, detail="Nur der Ersteller kann Admins entfernen")
+    body = await request.json()
+    member_id = body.get("member_id")
+    if not member_id:
+        raise HTTPException(status_code=400, detail="member_id erforderlich")
+    if member_id == user["id"]:
+        raise HTTPException(status_code=400, detail="Ersteller kann sich nicht selbst degradieren")
+    await db.chats.update_one({"_id": oid}, {"$pull": {"admin_ids": member_id}})
+    await ws_emit_to_chat(chat_id, 'chat:admin_demoted', {'user_id': user["id"], 'admin_id': member_id})
+    return {"message": "Admin degradiert"}
+
+@api_router.get("/chats/{chat_id}/admins")
+async def get_chat_admins(chat_id: str, user: dict = Depends(get_current_user)):
+    """List all admins of a group"""
+    oid = validate_object_id(chat_id)
+    chat = await db.chats.find_one({"_id": oid, "participant_ids": ObjectId(user["id"])})
+    if not chat:
+        raise HTTPException(status_code=404, detail="Chat nicht gefunden")
+    admin_ids = chat.get("admin_ids", [str(chat.get("created_by"))])
+    admins = []
+    for aid in admin_ids:
+        u = await db.users.find_one({"_id": ObjectId(aid)}, {"password_hash": 0, "contacts": 0, "blocked_users": 0})
+        if u:
+            admin_data = serialize_user_public(u)
+            admin_data["is_creator"] = aid == str(chat.get("created_by"))
+            admins.append(admin_data)
+    return {"admins": admins}
+
 @api_router.put("/chats/{chat_id}")
 async def update_chat(chat_id: str, request: Request, user: dict = Depends(get_current_user)):
     """Update group name or settings (admin only)"""
@@ -897,8 +952,8 @@ async def update_chat(chat_id: str, request: Request, user: dict = Depends(get_c
     chat = await db.chats.find_one({"_id": oid, "participant_ids": ObjectId(user["id"])})
     if not chat:
         raise HTTPException(status_code=404, detail="Chat nicht gefunden")
-    if str(chat.get("created_by")) != user["id"]:
-        raise HTTPException(status_code=403, detail="Nur der Ersteller kann Einstellungen ändern")
+    if str(chat.get("created_by")) != user["id"] and user["id"] not in chat.get("admin_ids", []):
+        raise HTTPException(status_code=403, detail="Nur Admins können Einstellungen ändern")
     body = await request.json()
     updates = {}
     if "name" in body: updates["name"] = body["name"]
