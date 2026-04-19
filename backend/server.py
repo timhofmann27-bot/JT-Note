@@ -802,15 +802,19 @@ async def create_chat(input: ChatCreate, user: dict = Depends(get_current_user))
 
 @api_router.get("/chats")
 async def get_chats(user: dict = Depends(get_current_user)):
+    """Chat list with minimized metadata — no participant details, no last message content"""
     chats = await db.chats.find({"participant_ids": ObjectId(user["id"])}).sort("last_message_at", -1).to_list(100)
     result = []
     for chat in chats:
         chat_data = serialize_chat(chat)
-        participants = []
-        for pid in chat.get("participant_ids", []):
-            p = await db.users.find_one({"_id": pid}, {"password_hash": 0, "contacts": 0, "blocked_users": 0})
-            if p: participants.append(serialize_user_public(p))
-        chat_data["participants"] = participants
+        # Metadata minimization: Only return participant count, not full details
+        chat_data["participant_count"] = len(chat.get("participant_ids", []))
+        # Remove participant_ids from list response (social graph protection)
+        chat_data.pop("participant_ids", None)
+        # Remove last_message content (already None from send_message)
+        chat_data.pop("last_message", None)
+        # Remove created_by (not needed in list)
+        chat_data.pop("created_by", None)
         unread = await db.messages.count_documents({"chat_id": str(chat["_id"]), "sender_id": {"$ne": user["id"]}, "read_by": {"$nin": [user["id"]]}})
         chat_data["unread_count"] = unread
         result.append(chat_data)
@@ -1033,10 +1037,18 @@ async def send_message(input: MessageSend, user: dict = Depends(get_current_user
     await db.chats.update_one({"_id": ObjectId(input.chat_id)}, {"$set": {"last_message": preview, "last_message_at": now}})
     msg_doc["_id"] = result.inserted_id
     serialized = serialize_message(msg_doc)
-    
+
+    # Metadata minimization: Store only message type indicator, NOT content preview
+    # The server should never see message content — even for E2EE messages, the type leaks metadata
+    await db.chats.update_one({"_id": ObjectId(input.chat_id)}, {"$set": {
+        "last_message": None,  # No plaintext preview — server sees nothing
+        "last_message_at": now,
+        "last_message_type": input.message_type,  # Only type (text/image/voice) — not content
+    }})
+
     # WebSocket: Push new message to all chat participants in realtime
     await ws_emit_to_chat(input.chat_id, 'message:new', serialized)
-    
+
     return {"message": serialized}
 
 @api_router.get("/messages/{chat_id}")
