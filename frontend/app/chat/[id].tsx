@@ -62,6 +62,8 @@ export default function ChatDetailScreen() {
   const [starredMessages, setStarredMessages] = useState<any[]>([]);
   const [showSearch, setShowSearch] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
+  const [showVerifyModal, setShowVerifyModal] = useState(false);
+  const [contactVerified, setContactVerified] = useState(false);
   const flatListRef = useRef<FlatList>(null);
   const typingTimer = useRef<any>(null);
   const lastMsgId = useRef<string | null>(null);
@@ -847,9 +849,9 @@ export default function ChatDetailScreen() {
           </View>
         </TouchableOpacity>
         {isE2EESessionActive && (
-          <View style={[styles.secIndicator, { backgroundColor: '#1B5E20', borderColor: '#4CAF50' }]}>
-            <Ionicons name="lock-closed" size={12} color="#4CAF50" />
-          </View>
+          <TouchableOpacity style={[styles.secIndicator, { backgroundColor: '#1B5E20', borderColor: '#4CAF50' }]} onPress={() => setShowVerifyModal(true)}>
+            <Ionicons name={contactVerified ? 'shield-checkmark' : 'lock-closed'} size={12} color="#4CAF50" />
+          </TouchableOpacity>
         )}
         {!isE2EESessionActive && (
           <View style={[styles.secIndicator, { backgroundColor: `${COLORS.warning}22`, borderColor: COLORS.warning }]}>
@@ -1316,6 +1318,64 @@ export default function ChatDetailScreen() {
         </SafeAreaView>
       </Modal>
 
+      {/* Contact Verification Modal */}
+      <Modal visible={showVerifyModal} animationType="slide" transparent>
+        <SafeAreaView style={styles.modalOverlay} edges={['top', 'bottom']}>
+          <View style={styles.modalContent}>
+            <View style={styles.modalHeader}>
+              <Text style={styles.modalTitle}>Kontakt verifizieren</Text>
+              <TouchableOpacity onPress={() => setShowVerifyModal(false)}>
+                <Ionicons name="close" size={24} color={COLORS.textPrimary} />
+              </TouchableOpacity>
+            </View>
+            <ScrollView style={{ padding: 16 }}>
+              <View style={styles.verifyInfo}>
+                <Ionicons name="shield-checkmark" size={48} color={contactVerified ? COLORS.success : COLORS.warning} />
+                <Text style={styles.verifyTitle}>
+                  {contactVerified ? 'Kontakt verifiziert' : 'Kontakt noch nicht verifiziert'}
+                </Text>
+                <Text style={styles.verifyDesc}>
+                  {contactVerified
+                    ? 'Du hast die Safety Numbers dieses Kontakts bestätigt. Man-in-the-Middle-Angriffe sind ausgeschlossen.'
+                    : 'Vergleiche die Safety Numbers mit deinem Kontakt — persönlich, per Telefon oder Videoanruf.'}
+                </Text>
+              </View>
+
+              {!chat?.is_group && getOtherParticipant() && (
+                <>
+                  <Text style={styles.verifySectionTitle}>SAFETY NUMBER</Text>
+                  <View style={styles.verifyCodeBox}>
+                    <Text style={styles.verifyCodeText}>{e2eeFingerprint || '—'}</Text>
+                  </View>
+                  <Text style={styles.verifyHint}>
+                    Diese Nummer muss mit der auf dem Gerät deines Kontakts identisch sein.
+                  </Text>
+
+                  {!contactVerified && (
+                    <TouchableOpacity
+                      style={styles.verifyBtn}
+                      onPress={() => {
+                        setContactVerified(true);
+                        setShowVerifyModal(false);
+                      }}
+                    >
+                      <Ionicons name="shield-checkmark" size={20} color={COLORS.white} />
+                      <Text style={styles.verifyBtnText}>Als verifiziert markieren</Text>
+                    </TouchableOpacity>
+                  )}
+                </>
+              )}
+
+              {chat?.is_group && (
+                <Text style={styles.verifyHint}>
+                  Gruppenchats nutzen Sender Keys. Verifiziere jeden Teilnehmer einzeln über 1:1 Chat.
+                </Text>
+              )}
+            </ScrollView>
+          </View>
+        </SafeAreaView>
+      </Modal>
+
       {/* Starred Messages Modal */}
       <Modal visible={showStarredModal} animationType="slide" transparent>
         <SafeAreaView style={styles.modalOverlay} edges={['top', 'bottom']}>
@@ -1655,4 +1715,15 @@ const styles = StyleSheet.create({
   groupNameSaveBtn: { padding: 4 },
   editGroupNameHint: { fontSize: FONTS.sizes.xs, color: COLORS.textMuted, textAlign: 'center', marginTop: 2 },
   removeMemberBtn: { padding: 8, borderRadius: 16, backgroundColor: 'rgba(196,75,75,0.1)', alignItems: 'center', justifyContent: 'center' },
+
+  // Contact verification
+  verifyInfo: { alignItems: 'center', paddingVertical: 16 },
+  verifyTitle: { fontSize: FONTS.sizes.lg, fontWeight: FONTS.weights.bold, color: COLORS.textPrimary, marginTop: 12 },
+  verifyDesc: { fontSize: FONTS.sizes.sm, color: COLORS.textMuted, textAlign: 'center', marginTop: 8, lineHeight: 20 },
+  verifySectionTitle: { fontSize: FONTS.sizes.xs, fontWeight: FONTS.weights.bold, color: COLORS.textMuted, letterSpacing: 2, marginTop: 16, marginBottom: 8 },
+  verifyCodeBox: { backgroundColor: COLORS.surface, borderRadius: 12, padding: 16, borderWidth: 1, borderColor: COLORS.border },
+  verifyCodeText: { fontSize: FONTS.sizes.md, fontWeight: FONTS.weights.bold, color: COLORS.primaryLight, textAlign: 'center', letterSpacing: 2, fontFamily: FONTS.family.monospace },
+  verifyHint: { fontSize: FONTS.sizes.xs, color: COLORS.textMuted, textAlign: 'center', marginTop: 12, lineHeight: 18 },
+  verifyBtn: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, backgroundColor: COLORS.success, borderRadius: 12, padding: 14, marginTop: 20 },
+  verifyBtnText: { fontSize: FONTS.sizes.base, fontWeight: FONTS.weights.bold, color: COLORS.white },
 });
