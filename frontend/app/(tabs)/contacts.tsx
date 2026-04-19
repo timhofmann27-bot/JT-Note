@@ -1,10 +1,11 @@
 import React, { useState, useCallback } from 'react';
-import { View, Text, TouchableOpacity, StyleSheet, FlatList, ActivityIndicator, TextInput } from 'react-native';
+import { View, Text, TouchableOpacity, StyleSheet, FlatList, ActivityIndicator, TextInput, Modal } from 'react-native';
 import { useRouter, useFocusEffect } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
 import { useAuth } from '../../src/context/AuthContext';
 import { contactsAPI, chatsAPI } from '../../src/utils/api';
 import { COLORS, FONTS, SPACING, ROLES } from '../../src/utils/theme';
+import QRScanner from '../../src/components/QRScanner';
 
 type TabType = 'contacts' | 'requests' | 'addcode';
 
@@ -18,6 +19,7 @@ export default function ContactsScreen() {
   const [codeMsg, setCodeMsg] = useState('');
   const [codeSending, setCodeSending] = useState(false);
   const [search, setSearch] = useState('');
+  const [showQRScanner, setShowQRScanner] = useState(false);
   const { user } = useAuth();
   const router = useRouter();
 
@@ -164,6 +166,10 @@ export default function ContactsScreen() {
                 <Ionicons name="key" size={16} color={COLORS.primaryLight} />
                 <Text style={styles.emptyBtnText}>Code eingeben</Text>
               </TouchableOpacity>
+              <TouchableOpacity testID="scan-qr-btn" style={[styles.emptyBtn, { marginTop: 12 }]} onPress={() => setShowQRScanner(true)}>
+                <Ionicons name="qr-code" size={16} color={COLORS.primaryLight} />
+                <Text style={styles.emptyBtnText}>QR-Code scannen</Text>
+              </TouchableOpacity>
             </View>
           ) : (
             <FlatList data={filtered} renderItem={renderContact} keyExtractor={item => item.id}
@@ -217,8 +223,17 @@ export default function ContactsScreen() {
               <Text style={[styles.codeMsgText, { color: codeMsg.includes('gesendet') ? COLORS.success : COLORS.danger }]}>{codeMsg}</Text>
             </View>
           ) : null}
+          <TouchableOpacity testID="scan-qr-btn-bottom" style={[styles.emptyBtn, { marginTop: 16 }]} onPress={() => setShowQRScanner(true)}>
+            <Ionicons name="qr-code" size={16} color={COLORS.primaryLight} />
+            <Text style={styles.emptyBtnText}>QR-Code scannen</Text>
+          </TouchableOpacity>
         </View>
       )}
+
+      {/* QR Scanner Modal */}
+      <Modal visible={showQRScanner} animationType="slide">
+        <QRScanner onScan={() => setShowQRScanner(false)} onClose={() => setShowQRScanner(false)} />
+      </Modal>
     </View>
   );
 }
