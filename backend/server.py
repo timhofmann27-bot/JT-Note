@@ -122,6 +122,86 @@ async def ws_emit_to_user(user_id: str, event: str, data: dict):
     for sid in sids:
         await sio.emit(event, data, to=sid)
 
+# ==================== WebRTC CALL SIGNALING ====================
+# E2EE via DTLS-SRTP — server only relays signaling, never sees media
+
+@sio.event
+async def call_offer(sid, data):
+    """Relay WebRTC offer from caller to callee"""
+    session = await sio.get_session(sid)
+    if not session:
+        return
+    target_user = data.get('to')
+    if not target_user:
+        return
+    await ws_emit_to_user(target_user, 'call:offer', {
+        'from': session['user_id'],
+        'from_username': session.get('username', ''),
+        'from_name': session.get('name', ''),
+        'offer': data.get('offer'),
+        'call_type': data.get('call_type', 'audio'),  # audio or video
+        'call_id': data.get('call_id'),
+    })
+
+@sio.event
+async def call_answer(sid, data):
+    """Relay WebRTC answer from callee to caller"""
+    session = await sio.get_session(sid)
+    if not session:
+        return
+    target_user = data.get('to')
+    if not target_user:
+        return
+    await ws_emit_to_user(target_user, 'call:answer', {
+        'from': session['user_id'],
+        'answer': data.get('answer'),
+        'call_id': data.get('call_id'),
+    })
+
+@sio.event
+async def call_ice_candidate(sid, data):
+    """Relay ICE candidate between peers"""
+    session = await sio.get_session(sid)
+    if not session:
+        return
+    target_user = data.get('to')
+    if not target_user:
+        return
+    await ws_emit_to_user(target_user, 'call:ice-candidate', {
+        'from': session['user_id'],
+        'candidate': data.get('candidate'),
+        'call_id': data.get('call_id'),
+    })
+
+@sio.event
+async def call_hangup(sid, data):
+    """Notify peer that call ended"""
+    session = await sio.get_session(sid)
+    if not session:
+        return
+    target_user = data.get('to')
+    if not target_user:
+        return
+    await ws_emit_to_user(target_user, 'call:hangup', {
+        'from': session['user_id'],
+        'call_id': data.get('call_id'),
+        'reason': data.get('reason', 'hangup'),
+    })
+
+@sio.event
+async def call_reject(sid, data):
+    """Notify peer that call was rejected"""
+    session = await sio.get_session(sid)
+    if not session:
+        return
+    target_user = data.get('to')
+    if not target_user:
+        return
+    await ws_emit_to_user(target_user, 'call:reject', {
+        'from': session['user_id'],
+        'call_id': data.get('call_id'),
+    })
+
 # ==================== SECURITY MIDDLEWARE ====================
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):

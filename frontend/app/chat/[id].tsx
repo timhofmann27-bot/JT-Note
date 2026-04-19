@@ -679,6 +679,26 @@ export default function ChatDetailScreen() {
     return other?.status === 'online' ? 'Online' : 'Offline';
   };
 
+  const startCall = async (callType: 'audio' | 'video') => {
+    if (!id || !user) return;
+
+    const otherParticipant = getOtherParticipant();
+    if (!otherParticipant) {
+      Alert.alert('Fehler', 'Konnte den Gesprächspartner nicht finden');
+      return;
+    }
+
+    const callId = `${id}_${Date.now()}`;
+
+    // Navigate to the call screen
+    router.push(`/call/${callId}`, {
+      remoteUserId: otherParticipant.id,
+      remoteName: otherParticipant.name,
+      callType,
+      isIncoming: 'false',
+    });
+  };
+
   const getSecColor = (level: string) => {
     const found = SECURITY_LEVELS.find(s => s.key === level);
     return found?.color || COLORS.unclassified;
