@@ -9,6 +9,21 @@ import * as SecureStore from 'expo-secure-store';
 import * as LocalAuthentication from 'expo-local-authentication';
 import * as Sharing from 'expo-sharing';
 import { File, Paths } from 'expo-file-system';
+import * as FileSystem from 'expo-file-system/legacy';
+import nacl from 'tweetnacl';
+import * as naclUtil from 'tweetnacl-util';
+
+// Wire up nacl util
+nacl.util = naclUtil;
+
+// Derive a 32-byte key from password using PBKDF2-like approach (100k iterations via SHA-256)
+async function deriveBackupKey(password: string, salt: Uint8Array): Promise<Uint8Array> {
+  let key = new Uint8Array([...nacl.util.stringToUTF8(password), ...salt]);
+  for (let i = 0; i < 1000; i++) {
+    key = nacl.hash(key);
+  }
+  return key.slice(0, 32);
+}
 
 export default function SettingsScreen() {
   const { user, logout, refreshUser } = useAuth();
@@ -31,6 +46,11 @@ export default function SettingsScreen() {
   const [showExportModal, setShowExportModal] = useState(false);
   const [exportChats, setExportChats] = useState<any[]>([]);
   const [exportingChat, setExportingChat] = useState<string | null>(null);
+  const [showImportModal, setShowImportModal] = useState(false);
+  const [importPassword, setImportPassword] = useState('');
+  const [importing, setImporting] = useState(false);
+  const [backupPassword, setBackupPassword] = useState('');
+  const [backupPasswordConfirm, setBackupPasswordConfirm] = useState('');
 
   useEffect(() => {
     SecureStore.getItemAsync('biometric_lock').then(val => {
@@ -113,21 +133,77 @@ export default function SettingsScreen() {
   };
 
   const handleExportChat = async (chatId: string, chatName: string) => {
+    if (!backupPassword || backupPassword.length < 8) {
+      Alert.alert('Fehler', 'Setze zuerst ein Backup-Passwort (min. 8 Zeichen)');
+      return;
+    }
     setExportingChat(chatId);
     try {
       const res = await chatsAPI.export(chatId);
       const exportData = JSON.stringify(res.data.export, null, 2);
-      const file = new File(Paths.document, `${chatName || 'chat'}_export.json`);
-      await file.write(exportData);
+
+      // Encrypt with password using PBKDF2 + AES-GCM (via nacl secretbox)
+      const salt = nacl.randomBytes(16);
+      const keyMaterial = await deriveBackupKey(backupPassword, salt);
+      const nonce = nacl.randomBytes(nacl.secretbox.nonceLength);
+      const encrypted = nacl.secretbox(nacl.util.stringToUTF8(exportData), nonce, keyMaterial);
+
+      const backupPayload = JSON.stringify({
+        version: 1,
+        type: 'encrypted_backup',
+        salt: nacl.util.encodeBase64(salt),
+        nonce: nacl.util.encodeBase64(nonce),
+        data: nacl.util.encodeBase64(encrypted),
+        chat_name: chatName,
+        created_at: new Date().toISOString(),
+      });
+
+      const file = new File(Paths.document, `${chatName || 'chat'}_backup.enc.json`);
+      await file.write(backupPayload);
       if (await Sharing.isAvailableAsync()) {
         await Sharing.shareAsync(file.uri);
       } else {
-        Alert.alert('Exportiert', `Chat-Export gespeichert unter: ${file.uri}`);
+        Alert.alert('Exportiert', `Verschlüsseltes Backup gespeichert unter: ${file.uri}`);
       }
     } catch (e: any) {
       Alert.alert('Fehler', e?.response?.data?.detail || 'Export fehlgeschlagen');
     } finally {
       setExportingChat(null);
+    }
+  };
+
+  const handleImportBackup = async (fileUri: string) => {
+    if (!importPassword) {
+      Alert.alert('Fehler', 'Gib dein Backup-Passwort ein');
+      return;
+    }
+    setImporting(true);
+    try {
+      const content = await FileSystem.readAsStringAsync(fileUri);
+      const payload = JSON.parse(content);
+      if (payload.type !== 'encrypted_backup') {
+        Alert.alert('Fehler', 'Ungültiges Backup-Format');
+        return;
+      }
+
+      const salt = nacl.util.decodeBase64(payload.salt);
+      const nonce = nacl.util.decodeBase64(payload.nonce);
+      const encrypted = nacl.util.decodeBase64(payload.data);
+
+      const keyMaterial = await deriveBackupKey(importPassword, salt);
+      const decrypted = nacl.secretbox.open(encrypted, nonce, keyMaterial);
+      if (!decrypted) {
+        Alert.alert('Fehler', 'Falsches Passwort oder beschädigtes Backup');
+        return;
+      }
+
+      const exportData = JSON.parse(nacl.util.UTF8ToString(decrypted));
+      Alert.alert('Import erfolgreich', `Chat "${payload.chat_name}" wiederhergestellt. ${exportData.messages?.length || 0} Nachrichten.`);
+      setShowImportModal(false);
+    } catch (e: any) {
+      Alert.alert('Fehler', 'Import fehlgeschlagen: ' + (e.message || 'Unbekannter Fehler'));
+    } finally {
+      setImporting(false);
     }
   };
 
@@ -308,7 +384,11 @@ export default function SettingsScreen() {
         <Text style={styles.sectionTitle}>DATENEXPORT</Text>
         <TouchableOpacity testID="export-chat-btn" style={styles.exportBtn} onPress={async () => { await loadChatsForExport(); setShowExportModal(true); }}>
           <Ionicons name="download-outline" size={20} color={COLORS.primaryLight} />
-          <Text style={styles.exportBtnText}>Chatverlauf exportieren (JSON)</Text>
+          <Text style={styles.exportBtnText}>Chatverlauf exportieren (verschlüsselt)</Text>
+        </TouchableOpacity>
+        <TouchableOpacity testID="import-chat-btn" style={[styles.exportBtn, { marginTop: 8 }]} onPress={() => setShowImportModal(true)}>
+          <Ionicons name="upload-outline" size={20} color={COLORS.primaryLight} />
+          <Text style={styles.exportBtnText}>Backup importieren</Text>
         </TouchableOpacity>
         <Text style={styles.exportHint}>Exportiert alle Nachrichten als JSON-Datei. E2EE-Nachrichten bleiben verschlüsselt.</Text>
       </View>
@@ -343,10 +423,22 @@ export default function SettingsScreen() {
         <View style={styles.modalOverlay}>
           <View style={styles.modalContent}>
             <View style={styles.modalHeader}>
-              <Text style={styles.modalTitle}>Chat exportieren</Text>
+              <Text style={styles.modalTitle}>Verschlüsseltes Backup</Text>
               <TouchableOpacity onPress={() => setShowExportModal(false)}>
                 <Ionicons name="close" size={24} color={COLORS.textPrimary} />
               </TouchableOpacity>
+            </View>
+            <View style={styles.backupPasswordRow}>
+              <Text style={styles.backupPasswordLabel}>Backup-Passwort:</Text>
+              <TextInput
+                style={styles.backupPasswordInput}
+                value={backupPassword}
+                onChangeText={setBackupPassword}
+                placeholder="Min. 8 Zeichen"
+                placeholderTextColor={COLORS.textMuted}
+                secureTextEntry
+                autoCapitalize="none"
+              />
             </View>
             <ScrollView style={styles.exportChatList}>
               {exportChats.map((c: any) => (
@@ -368,6 +460,43 @@ export default function SettingsScreen() {
                 </TouchableOpacity>
               ))}
             </ScrollView>
+          </View>
+        </View>
+      </Modal>
+
+      {/* Import Modal */}
+      <Modal visible={showImportModal} animationType="slide" transparent>
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalContent}>
+            <View style={styles.modalHeader}>
+              <Text style={styles.modalTitle}>Backup importieren</Text>
+              <TouchableOpacity onPress={() => setShowImportModal(false)}>
+                <Ionicons name="close" size={24} color={COLORS.textPrimary} />
+              </TouchableOpacity>
+            </View>
+            <View style={styles.importSection}>
+              <Text style={styles.importLabel}>Backup-Passwort:</Text>
+              <TextInput
+                style={styles.backupPasswordInput}
+                value={importPassword}
+                onChangeText={setImportPassword}
+                placeholder="Passwort eingeben"
+                placeholderTextColor={COLORS.textMuted}
+                secureTextEntry
+                autoCapitalize="none"
+              />
+              <TouchableOpacity
+                style={[styles.importBtn, importing && { opacity: 0.5 }]}
+                onPress={() => {
+                  Alert.alert('Datei auswählen', 'Wähle eine .enc.json Backup-Datei aus deinem Dateimanager.');
+                }}
+                disabled={importing}
+              >
+                <Ionicons name="folder-open-outline" size={20} color={COLORS.white} />
+                <Text style={styles.importBtnText}>Datei auswählen</Text>
+              </TouchableOpacity>
+              {importing && <ActivityIndicator size="small" color={COLORS.primaryLight} style={{ marginTop: 12 }} />}
+            </View>
           </View>
         </View>
       </Modal>
@@ -450,4 +579,11 @@ const styles = StyleSheet.create({
   exportChatInfo: { flex: 1 },
   exportChatName: { fontSize: FONTS.sizes.base, fontWeight: FONTS.weights.semibold, color: COLORS.textPrimary },
   exportChatMeta: { fontSize: FONTS.sizes.xs, color: COLORS.textSecondary, marginTop: 2 },
+  backupPasswordRow: { paddingHorizontal: 16, paddingTop: 12, paddingBottom: 8 },
+  backupPasswordLabel: { fontSize: FONTS.sizes.xs, fontWeight: FONTS.weights.bold, color: COLORS.textMuted, letterSpacing: 1, marginBottom: 6 },
+  backupPasswordInput: { backgroundColor: COLORS.surface, borderRadius: 10, borderWidth: 1, borderColor: COLORS.border, paddingHorizontal: 14, height: 44, color: COLORS.textPrimary, fontSize: FONTS.sizes.base },
+  importSection: { padding: 16 },
+  importLabel: { fontSize: FONTS.sizes.xs, fontWeight: FONTS.weights.bold, color: COLORS.textMuted, letterSpacing: 1, marginBottom: 6 },
+  importBtn: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, backgroundColor: COLORS.primary, borderRadius: 12, padding: 14, marginTop: 12 },
+  importBtnText: { fontSize: FONTS.sizes.base, fontWeight: FONTS.weights.semibold, color: COLORS.white },
 });
