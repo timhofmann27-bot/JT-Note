@@ -1,12 +1,14 @@
 import React, { useState, useEffect } from 'react';
-import { View, Text, TouchableOpacity, StyleSheet, ScrollView, TextInput, Alert, ActivityIndicator, Image, Switch } from 'react-native';
+import { View, Text, TouchableOpacity, StyleSheet, ScrollView, TextInput, Alert, ActivityIndicator, Image, Switch, Modal } from 'react-native';
 import { useRouter } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
 import { useAuth } from '../../src/context/AuthContext';
-import { profileAPI, authAPI, contactsAPI } from '../../src/utils/api';
+import { profileAPI, authAPI, contactsAPI, chatsAPI } from '../../src/utils/api';
 import { COLORS, FONTS, SPACING, ROLES } from '../../src/utils/theme';
 import * as SecureStore from 'expo-secure-store';
 import * as LocalAuthentication from 'expo-local-authentication';
+import * as Sharing from 'expo-sharing';
+import { File, Paths } from 'expo-file-system';
 
 export default function SettingsScreen() {
   const { user, logout, refreshUser } = useAuth();
@@ -26,6 +28,9 @@ export default function SettingsScreen() {
   const [codeLoading, setCodeLoading] = useState(false);
   const [biometricEnabled, setBiometricEnabled] = useState(false);
   const [biometricAvailable, setBiometricAvailable] = useState(false);
+  const [showExportModal, setShowExportModal] = useState(false);
+  const [exportChats, setExportChats] = useState<any[]>([]);
+  const [exportingChat, setExportingChat] = useState<string | null>(null);
 
   useEffect(() => {
     SecureStore.getItemAsync('biometric_lock').then(val => {
@@ -99,6 +104,32 @@ export default function SettingsScreen() {
     finally { setCodeLoading(false); }
   };
   React.useEffect(() => { loadAddCode(); }, []);
+
+  const loadChatsForExport = async () => {
+    try {
+      const res = await chatsAPI.list();
+      setExportChats(res.data.chats || []);
+    } catch (e) { console.log(e); }
+  };
+
+  const handleExportChat = async (chatId: string, chatName: string) => {
+    setExportingChat(chatId);
+    try {
+      const res = await chatsAPI.export(chatId);
+      const exportData = JSON.stringify(res.data.export, null, 2);
+      const file = new File(Paths.document, `${chatName || 'chat'}_export.json`);
+      await file.write(exportData);
+      if (await Sharing.isAvailableAsync()) {
+        await Sharing.shareAsync(file.uri);
+      } else {
+        Alert.alert('Exportiert', `Chat-Export gespeichert unter: ${file.uri}`);
+      }
+    } catch (e: any) {
+      Alert.alert('Fehler', e?.response?.data?.detail || 'Export fehlgeschlagen');
+    } finally {
+      setExportingChat(null);
+    }
+  };
 
 
   const roleInfo = ROLES[(user?.role || 'soldier') as keyof typeof ROLES] || ROLES.soldier;
@@ -274,6 +305,16 @@ export default function SettingsScreen() {
 
       {/* Actions */}
       <View style={styles.section}>
+        <Text style={styles.sectionTitle}>DATENEXPORT</Text>
+        <TouchableOpacity testID="export-chat-btn" style={styles.exportBtn} onPress={async () => { await loadChatsForExport(); setShowExportModal(true); }}>
+          <Ionicons name="download-outline" size={20} color={COLORS.primaryLight} />
+          <Text style={styles.exportBtnText}>Chatverlauf exportieren (JSON)</Text>
+        </TouchableOpacity>
+        <Text style={styles.exportHint}>Exportiert alle Nachrichten als JSON-Datei. E2EE-Nachrichten bleiben verschlüsselt.</Text>
+      </View>
+
+      {/* Actions */}
+      <View style={styles.section}>
         <Text style={styles.sectionTitle}>AKTIONEN</Text>
         <TouchableOpacity testID="logout-button" style={styles.logoutBtn} onPress={handleLogout}>
           <Ionicons name="log-out-outline" size={20} color={COLORS.danger} />
@@ -296,6 +337,40 @@ export default function SettingsScreen() {
         <Text style={styles.versionText}>SS-Note v2.0.0</Text>
         <Text style={styles.versionSub}>DSGVO-konform | Zero-PII | BSI-Standard</Text>
       </View>
+
+      {/* Export Modal */}
+      <Modal visible={showExportModal} animationType="slide" transparent>
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalContent}>
+            <View style={styles.modalHeader}>
+              <Text style={styles.modalTitle}>Chat exportieren</Text>
+              <TouchableOpacity onPress={() => setShowExportModal(false)}>
+                <Ionicons name="close" size={24} color={COLORS.textPrimary} />
+              </TouchableOpacity>
+            </View>
+            <ScrollView style={styles.exportChatList}>
+              {exportChats.map((c: any) => (
+                <TouchableOpacity
+                  key={c.id}
+                  style={styles.exportChatItem}
+                  onPress={() => handleExportChat(c.id, c.name || c.id)}
+                  disabled={exportingChat === c.id}
+                >
+                  <View style={styles.exportChatInfo}>
+                    <Text style={styles.exportChatName} numberOfLines={1}>{c.is_group ? c.name : (c.participants?.find((p: any) => p.id !== user?.id)?.name || 'Chat')}</Text>
+                    <Text style={styles.exportChatMeta}>{c.is_group ? 'Gruppe' : 'Direktnachricht'}</Text>
+                  </View>
+                  {exportingChat === c.id ? (
+                    <ActivityIndicator size="small" color={COLORS.primaryLight} />
+                  ) : (
+                    <Ionicons name="download-outline" size={20} color={COLORS.primaryLight} />
+                  )}
+                </TouchableOpacity>
+              ))}
+            </ScrollView>
+          </View>
+        </View>
+      </Modal>
     </ScrollView>
   );
 }
@@ -363,4 +438,16 @@ const styles = StyleSheet.create({
   versionInfo: { alignItems: 'center', marginTop: 32, paddingBottom: 20 },
   versionText: { fontSize: FONTS.sizes.sm, color: COLORS.textMuted },
   versionSub: { fontSize: FONTS.sizes.xs, color: COLORS.textMuted, marginTop: 2 },
+  exportBtn: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, backgroundColor: COLORS.primaryDark, borderRadius: 12, padding: 16, borderWidth: 1, borderColor: COLORS.primary },
+  exportBtnText: { fontSize: FONTS.sizes.base, fontWeight: FONTS.weights.semibold, color: COLORS.primaryLight },
+  exportHint: { fontSize: FONTS.sizes.xs, color: COLORS.textMuted, textAlign: 'center', marginTop: 8 },
+  modalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.5)', justifyContent: 'flex-end' },
+  modalContent: { backgroundColor: COLORS.background, borderTopLeftRadius: 20, borderTopRightRadius: 20, maxHeight: '70%', paddingBottom: 20 },
+  modalHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', padding: 16, borderBottomWidth: 1, borderBottomColor: COLORS.border },
+  modalTitle: { fontSize: FONTS.sizes.lg, fontWeight: FONTS.weights.bold, color: COLORS.textPrimary },
+  exportChatList: { maxHeight: 400 },
+  exportChatItem: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16, paddingVertical: 14, borderBottomWidth: 1, borderBottomColor: COLORS.border },
+  exportChatInfo: { flex: 1 },
+  exportChatName: { fontSize: FONTS.sizes.base, fontWeight: FONTS.weights.semibold, color: COLORS.textPrimary },
+  exportChatMeta: { fontSize: FONTS.sizes.xs, color: COLORS.textSecondary, marginTop: 2 },
 });

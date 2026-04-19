@@ -43,6 +43,8 @@ export default function ChatDetailScreen() {
   const [selfDestruct, setSelfDestruct] = useState<number | null>(null);
   const [showGroupInfo, setShowGroupInfo] = useState(false);
   const [groupMembers, setGroupMembers] = useState<any[]>([]);
+  const [editingGroupName, setEditingGroupName] = useState(false);
+  const [groupName, setGroupName] = useState('');
   const [contacts, setContacts] = useState<any[]>([]);
   const [isE2EESessionActive, setIsE2EESessionActive] = useState(false);
   const [e2eeFingerprint, setE2eeFingerprint] = useState<string | null>(null);
@@ -52,6 +54,14 @@ export default function ChatDetailScreen() {
   const [pendingMedia, setPendingMedia] = useState<{ uri: string; base64: string; type: string; fileName?: string } | null>(null);
   const [replyTo, setReplyTo] = useState<any>(null);
   const [messageActions, setMessageActions] = useState<{ msg: any; x: number; y: number } | null>(null);
+  const [showForwardModal, setShowForwardModal] = useState(false);
+  const [forwardTargetChats, setForwardTargetChats] = useState<any[]>([]);
+  const [forwardingMsg, setForwardingMsg] = useState<string | null>(null);
+  const [pinnedMessage, setPinnedMessage] = useState<any>(null);
+  const [showStarredModal, setShowStarredModal] = useState(false);
+  const [starredMessages, setStarredMessages] = useState<any[]>([]);
+  const [showSearch, setShowSearch] = useState(false);
+  const [searchQuery, setSearchQuery] = useState('');
   const flatListRef = useRef<FlatList>(null);
   const typingTimer = useRef<any>(null);
   const lastMsgId = useRef<string | null>(null);
@@ -64,6 +74,10 @@ export default function ChatDetailScreen() {
         chatsAPI.get(id), messagesAPI.list(id, 50),
       ]);
       setChat(chatRes.data.chat);
+      if (chatRes.data.chat?.pinned_message_id) {
+        const pinnedMsg = msgsRes.data.messages?.find((m: any) => m.id === chatRes.data.chat.pinned_message_id);
+        if (pinnedMsg) setPinnedMessage(pinnedMsg);
+      }
       
       const decryptedMessages = [];
       for (const msg of (msgsRes.data.messages || [])) {
@@ -577,10 +591,42 @@ export default function ChatDetailScreen() {
     return colors[Math.abs(hash) % colors.length];
   };
 
+  const filteredMessages = searchQuery.trim()
+    ? messages.filter(m => m.content?.toLowerCase().includes(searchQuery.toLowerCase()))
+    : messages;
+
   const loadContacts = async () => {
     try {
       const res = await contactsAPI.list();
       setContacts(res.data.contacts || []);
+    } catch (e) { console.log(e); }
+  };
+
+  const loadChatsForForward = async () => {
+    try {
+      const res = await chatsAPI.list();
+      setForwardTargetChats((res.data.chats || []).filter((c: any) => c.id !== id));
+    } catch (e) { console.log(e); }
+  };
+
+  const handleForward = async (targetChatId: string) => {
+    if (!messageActions?.msg?.id) return;
+    setForwardingMsg(messageActions.msg.id);
+    try {
+      await messagesAPI.forward(messageActions.msg.id, targetChatId);
+      setShowForwardModal(false);
+      setMessageActions(null);
+    } catch (e: any) {
+      Alert.alert('Fehler', e?.response?.data?.detail || 'Weiterleiten fehlgeschlagen');
+    } finally {
+      setForwardingMsg(null);
+    }
+  };
+
+  const loadStarredMessages = async () => {
+    try {
+      const res = await messagesAPI.getStarred(id!);
+      setStarredMessages(res.data.messages || []);
     } catch (e) { console.log(e); }
   };
 
@@ -594,12 +640,10 @@ export default function ChatDetailScreen() {
           text: 'Hinzufügen',
           onPress: async () => {
             try {
-              await chatsAPI.create({
-                participant_ids: [contactId],
-                is_group: false,
-              });
-              Alert.alert('Erfolg', 'Kontakt wurde eingeladen');
-              setShowGroupInfo(false);
+              await chatsAPI.addMember(id!, contactId);
+              const updated = await chatsAPI.get(id!);
+              setGroupMembers(updated.data.chat.participants || []);
+              Alert.alert('Erfolg', 'Mitglied hinzugefügt');
             } catch (e: any) {
               Alert.alert('Fehler', e?.response?.data?.detail || 'Konnte nicht hinzufügen');
             }
@@ -607,6 +651,40 @@ export default function ChatDetailScreen() {
         },
       ]
     );
+  };
+
+  const removeMember = async (memberId: string) => {
+    Alert.alert(
+      'Teilnehmer entfernen',
+      'Möchtest du dieses Mitglied wirklich entfernen?',
+      [
+        { text: 'Abbrechen', style: 'cancel' },
+        {
+          text: 'Entfernen',
+          style: 'destructive',
+          onPress: async () => {
+            try {
+              await chatsAPI.removeMember(id!, memberId);
+              const updated = await chatsAPI.get(id!);
+              setGroupMembers(updated.data.chat.participants || []);
+            } catch (e: any) {
+              Alert.alert('Fehler', e?.response?.data?.detail || 'Konnte nicht entfernen');
+            }
+          },
+        },
+      ]
+    );
+  };
+
+  const saveGroupName = async () => {
+    try {
+      await chatsAPI.update(id!, { name: groupName });
+      const updated = await chatsAPI.get(id!);
+      setChat(updated.data.chat);
+      setEditingGroupName(false);
+    } catch (e: any) {
+      Alert.alert('Fehler', e?.response?.data?.detail || 'Konnte nicht speichern');
+    }
   };
 
   const renderMessage = ({ item, index }: { item: any; index: number }) => {
@@ -619,12 +697,12 @@ export default function ChatDetailScreen() {
     const hasMedia = item.media_base64 || (item.e2ee && item.media_ciphertext);
 
     const showDate = index === 0 || (
-      new Date(item.created_at).toDateString() !== new Date(messages[index - 1]?.created_at).toDateString()
+      new Date(item.created_at).toDateString() !== new Date(filteredMessages[index - 1]?.created_at).toDateString()
     );
 
     const showNameSeparator = chat?.is_group && !isMine && index > 0 &&
-      messages[index - 1]?.sender_id !== item.sender_id &&
-      new Date(item.created_at).toDateString() === new Date(messages[index - 1]?.created_at).toDateString();
+      filteredMessages[index - 1]?.sender_id !== item.sender_id &&
+      new Date(item.created_at).toDateString() === new Date(filteredMessages[index - 1]?.created_at).toDateString();
 
     const getMediaIcon = (msg: any) => {
       if (msg.message_type === 'image') return 'image';
@@ -778,32 +856,80 @@ export default function ChatDetailScreen() {
             <Ionicons name="lock-open" size={12} color={COLORS.warning} />
           </View>
         )}
+        <TouchableOpacity style={styles.starBtn} onPress={async () => { await loadStarredMessages(); setShowStarredModal(true); }}>
+          <Ionicons name="star" size={20} color={COLORS.primaryLight} />
+        </TouchableOpacity>
+        <TouchableOpacity style={styles.starBtn} onPress={() => setShowSearch(!showSearch)}>
+          <Ionicons name={showSearch ? 'close' : 'search'} size={20} color={COLORS.primaryLight} />
+        </TouchableOpacity>
       </View>
 
+      {/* Search Bar */}
+      {showSearch && (
+        <View style={styles.searchBar}>
+          <Ionicons name="search" size={18} color={COLORS.textMuted} />
+          <TextInput
+            style={styles.searchInput}
+            value={searchQuery}
+            onChangeText={setSearchQuery}
+            placeholder="Nachrichten suchen..."
+            placeholderTextColor={COLORS.textMuted}
+            autoFocus
+          />
+          {searchQuery.length > 0 && (
+            <TouchableOpacity onPress={() => setSearchQuery('')}>
+              <Ionicons name="close-circle" size={18} color={COLORS.textMuted} />
+            </TouchableOpacity>
+          )}
+        </View>
+      )}
+
       <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : 'height'} style={styles.flex} keyboardVerticalOffset={0}>
+        {/* Pinned Message Bar */}
+        {pinnedMessage && (
+          <TouchableOpacity style={styles.pinnedBar} onPress={() => {
+            const idx = messages.findIndex(m => m.id === pinnedMessage.id);
+            if (idx >= 0) flatListRef.current?.scrollToIndex({ index: idx, animated: true });
+          }}>
+            <Ionicons name="pin" size={14} color={COLORS.primaryLight} />
+            <Text style={styles.pinnedBarText} numberOfLines={1}>{pinnedMessage.content}</Text>
+            <TouchableOpacity onPress={async () => {
+              try { await chatsAPI.unpinMessage(id!); setPinnedMessage(null); } catch (e) { console.log(e); }
+            }}>
+              <Ionicons name="close" size={16} color={COLORS.textMuted} />
+            </TouchableOpacity>
+          </TouchableOpacity>
+        )}
+
         {/* Messages */}
         <FlatList
           ref={flatListRef}
-          data={messages}
+          data={filteredMessages}
           renderItem={renderMessage}
           keyExtractor={(item) => item.id}
           contentContainerStyle={styles.messagesList}
           onContentSizeChange={() => flatListRef.current?.scrollToEnd({ animated: false })}
           onLayout={() => flatListRef.current?.scrollToEnd({ animated: false })}
           ListEmptyComponent={
-            <View style={styles.emptyMessages}>
-              <View style={styles.emptyIconCircle}>
-                <Ionicons name={isE2EESessionActive ? 'lock-closed' : 'lock-open'} size={32} color={isE2EESessionActive ? '#4CAF50' : COLORS.primaryLight} />
+            searchQuery.trim() ? (
+              <View style={styles.emptyMessages}>
+                <Text style={styles.emptyText}>Keine Ergebnisse für "{searchQuery}"</Text>
               </View>
-              <Text style={styles.emptyText}>
-                {isE2EESessionActive ? 'Verschlüsselter Kanal bereit' : 'Kanal bereit'}
-              </Text>
-              <Text style={styles.emptySubtext}>
-                {isE2EESessionActive
-                  ? 'Nachrichten sind Ende-zu-Ende verschlüsselt (Double Ratchet)'
-                  : 'Tippe auf das Schloss oben rechts für E2EE-Info'}
-              </Text>
-            </View>
+            ) : (
+              <View style={styles.emptyMessages}>
+                <View style={styles.emptyIconCircle}>
+                  <Ionicons name={isE2EESessionActive ? 'lock-closed' : 'lock-open'} size={32} color={isE2EESessionActive ? '#4CAF50' : COLORS.primaryLight} />
+                </View>
+                <Text style={styles.emptyText}>
+                  {isE2EESessionActive ? 'Verschlüsselter Kanal bereit' : 'Kanal bereit'}
+                </Text>
+                <Text style={styles.emptySubtext}>
+                  {isE2EESessionActive
+                    ? 'Nachrichten sind Ende-zu-Ende verschlüsselt (Double Ratchet)'
+                    : 'Tippe auf das Schloss oben rechts für E2EE-Info'}
+                </Text>
+              </View>
+            )
           }
         />
 
@@ -917,6 +1043,41 @@ export default function ChatDetailScreen() {
                 <Ionicons name="return-up-back" size={18} color={COLORS.primaryLight} />
                 <Text style={styles.msgContextMenuItemText}>Antworten</Text>
               </TouchableOpacity>
+              <TouchableOpacity style={styles.msgContextMenuItem} onPress={async () => {
+                setMessageActions(null);
+                await loadChatsForForward();
+                setShowForwardModal(true);
+              }}>
+                <Ionicons name="arrow-forward" size={18} color={COLORS.primaryLight} />
+                <Text style={styles.msgContextMenuItemText}>Weiterleiten</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.msgContextMenuItem} onPress={async () => {
+                try {
+                  if (pinnedMessage?.id === messageActions.msg.id) {
+                    await chatsAPI.unpinMessage(id!);
+                    setPinnedMessage(null);
+                  } else {
+                    await chatsAPI.pinMessage(id!, messageActions.msg.id);
+                    setPinnedMessage(messageActions.msg);
+                  }
+                } catch (e: any) {
+                  Alert.alert('Fehler', e?.response?.data?.detail || 'Anheften fehlgeschlagen');
+                }
+                setMessageActions(null);
+              }}>
+                <Ionicons name={pinnedMessage?.id === messageActions.msg.id ? 'pin' : 'pin-outline'} size={18} color={COLORS.primaryLight} />
+                <Text style={styles.msgContextMenuItemText}>{pinnedMessage?.id === messageActions.msg.id ? 'Loslösen' : 'Anheften'}</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.msgContextMenuItem} onPress={async () => {
+                try {
+                  await messagesAPI.star(messageActions.msg.id);
+                  setMessages(prev => prev.map(m => m.id === messageActions.msg.id ? { ...m, starred_by: [...(m.starred_by || []), user?.id] } : m));
+                } catch (e) { console.log(e); }
+                setMessageActions(null);
+              }}>
+                <Ionicons name="star" size={18} color={COLORS.primaryLight} />
+                <Text style={styles.msgContextMenuItemText}>Favorit</Text>
+              </TouchableOpacity>
               {messageActions.msg.sender_id === user?.id && (
                 <>
                   <TouchableOpacity style={styles.msgContextMenuItem} onPress={() => { setMessageActions(null); }}>
@@ -1019,7 +1180,29 @@ export default function ChatDetailScreen() {
               <View style={[styles.modalAvatar, { backgroundColor: `${getAvatarColor(id || '')}33` }]}>
                 <Ionicons name="people" size={32} color={getAvatarColor(id || '')} />
               </View>
-              <Text style={styles.modalGroupName}>{chat?.name || 'Gruppe'}</Text>
+              {editingGroupName ? (
+                <View style={styles.groupNameEditRow}>
+                  <TextInput
+                    style={styles.groupNameInput}
+                    value={groupName}
+                    onChangeText={setGroupName}
+                    placeholder="Gruppenname"
+                    placeholderTextColor={COLORS.textMuted}
+                    autoFocus
+                  />
+                  <TouchableOpacity style={styles.groupNameSaveBtn} onPress={saveGroupName}>
+                    <Ionicons name="checkmark" size={20} color={COLORS.success} />
+                  </TouchableOpacity>
+                  <TouchableOpacity onPress={() => { setEditingGroupName(false); setGroupName(chat?.name || ''); }}>
+                    <Ionicons name="close" size={20} color={COLORS.textMuted} />
+                  </TouchableOpacity>
+                </View>
+              ) : (
+                <TouchableOpacity onPress={() => { setEditingGroupName(true); setGroupName(chat?.name || ''); }}>
+                  <Text style={styles.modalGroupName}>{chat?.name || 'Gruppe'}</Text>
+                  <Text style={styles.editGroupNameHint}>Tippen zum Bearbeiten</Text>
+                </TouchableOpacity>
+              )}
               <Text style={styles.modalGroupCount}>{groupMembers.length} Teilnehmer</Text>
             </View>
 
@@ -1034,9 +1217,13 @@ export default function ChatDetailScreen() {
                     <Text style={styles.modalMemberName}>{member.name}</Text>
                     <Text style={styles.modalMemberCallsign}>{member.callsign}</Text>
                   </View>
-                  {member.id === user?.id && (
+                  {member.id === user?.id ? (
                     <Text style={styles.modalMemberBadge}>Du</Text>
-                  )}
+                  ) : chat?.created_by === user?.id ? (
+                    <TouchableOpacity style={styles.removeMemberBtn} onPress={() => removeMember(member.id)}>
+                      <Ionicons name="person-remove" size={16} color={COLORS.danger} />
+                    </TouchableOpacity>
+                  ) : null}
                 </View>
               ))}
             </ScrollView>
@@ -1125,6 +1312,87 @@ export default function ChatDetailScreen() {
                 <Text style={styles.algoText}>Double Ratchet (Forward Secrecy)</Text>
               </View>
             </View>
+          </View>
+        </SafeAreaView>
+      </Modal>
+
+      {/* Starred Messages Modal */}
+      <Modal visible={showStarredModal} animationType="slide" transparent>
+        <SafeAreaView style={styles.modalOverlay} edges={['top', 'bottom']}>
+          <View style={styles.modalContent}>
+            <View style={styles.modalHeader}>
+              <Text style={styles.modalTitle}>Favoriten</Text>
+              <TouchableOpacity onPress={() => setShowStarredModal(false)}>
+                <Ionicons name="close" size={24} color={COLORS.textPrimary} />
+              </TouchableOpacity>
+            </View>
+            <ScrollView style={styles.starredList}>
+              {starredMessages.length === 0 ? (
+                <View style={styles.forwardEmpty}>
+                  <Ionicons name="star-outline" size={32} color={COLORS.textMuted} />
+                  <Text style={styles.forwardEmptyText}>Keine Favoriten</Text>
+                </View>
+              ) : (
+                starredMessages.map((m: any) => (
+                  <TouchableOpacity
+                    key={m.id}
+                    style={styles.starredItem}
+                    onPress={() => {
+                      setShowStarredModal(false);
+                      const idx = messages.findIndex(msg => msg.id === m.id);
+                      if (idx >= 0) flatListRef.current?.scrollToIndex({ index: idx, animated: true });
+                    }}
+                  >
+                    <View style={styles.starredItemHeader}>
+                      <Text style={styles.starredSender}>{m.sender_id === user?.id ? 'Du' : (m.sender_name || 'Unbekannt')}</Text>
+                      <Text style={styles.starredTime}>{formatTime(m.created_at)}</Text>
+                    </View>
+                    <Text style={styles.starredContent} numberOfLines={2}>{m.content}</Text>
+                  </TouchableOpacity>
+                ))
+              )}
+            </ScrollView>
+          </View>
+        </SafeAreaView>
+      </Modal>
+      <Modal visible={showForwardModal} animationType="slide" transparent>
+        <SafeAreaView style={styles.modalOverlay} edges={['top', 'bottom']}>
+          <View style={styles.modalContent}>
+            <View style={styles.modalHeader}>
+              <Text style={styles.modalTitle}>Weiterleiten an...</Text>
+              <TouchableOpacity onPress={() => setShowForwardModal(false)}>
+                <Ionicons name="close" size={24} color={COLORS.textPrimary} />
+              </TouchableOpacity>
+            </View>
+            <ScrollView style={styles.forwardChatList}>
+              {forwardTargetChats.length === 0 ? (
+                <View style={styles.forwardEmpty}>
+                  <Text style={styles.forwardEmptyText}>Keine anderen Chats verfügbar</Text>
+                </View>
+              ) : (
+                forwardTargetChats.map((c: any) => (
+                  <TouchableOpacity
+                    key={c.id}
+                    style={[styles.forwardChatItem, forwardingMsg === messageActions?.msg?.id && styles.forwardChatItemDisabled]}
+                    onPress={() => handleForward(c.id)}
+                    disabled={forwardingMsg === messageActions?.msg?.id}
+                  >
+                    <View style={[styles.forwardChatAvatar, { backgroundColor: `${getAvatarColor(c.id)}33` }]}>
+                      <Ionicons name={c.is_group ? 'people' : 'person'} size={20} color={c.is_group ? getAvatarColor(c.id) : COLORS.textSecondary} />
+                    </View>
+                    <View style={styles.forwardChatInfo}>
+                      <Text style={styles.forwardChatName} numberOfLines={1}>{c.is_group ? c.name : (c.participants?.find((p: any) => p.id !== user?.id)?.name || 'Chat')}</Text>
+                      <Text style={styles.forwardChatMeta} numberOfLines={1}>{c.is_group ? `${(c.participants?.length || 0)} Teilnehmer` : ''}</Text>
+                    </View>
+                    {forwardingMsg === messageActions?.msg?.id ? (
+                      <ActivityIndicator size="small" color={COLORS.primaryLight} />
+                    ) : (
+                      <Ionicons name="arrow-forward" size={18} color={COLORS.primaryLight} />
+                    )}
+                  </TouchableOpacity>
+                ))
+              )}
+            </ScrollView>
           </View>
         </SafeAreaView>
       </Modal>
@@ -1344,4 +1612,47 @@ const styles = StyleSheet.create({
   msgReactionEmoji: { fontSize: 12 },
   msgReactionCount: { fontSize: 10, color: COLORS.textMuted, marginLeft: 2 },
   msgEdited: { fontSize: 9, color: COLORS.textMuted, fontStyle: 'italic' },
+
+  // Forward modal
+  forwardChatList: { maxHeight: 400 },
+  forwardEmpty: { padding: 32, alignItems: 'center' },
+  forwardEmptyText: { fontSize: FONTS.sizes.sm, color: COLORS.textMuted },
+  forwardChatItem: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16, paddingVertical: 12 },
+  forwardChatItemDisabled: { opacity: 0.5 },
+  forwardChatAvatar: { width: 44, height: 44, borderRadius: 22, alignItems: 'center', justifyContent: 'center', marginRight: 12 },
+  forwardChatInfo: { flex: 1 },
+  forwardChatName: { fontSize: FONTS.sizes.base, fontWeight: FONTS.weights.semibold, color: COLORS.textPrimary },
+  forwardChatMeta: { fontSize: FONTS.sizes.xs, color: COLORS.textSecondary, marginTop: 2 },
+
+  // Pinned message bar
+  pinnedBar: {
+    flexDirection: 'row', alignItems: 'center', paddingHorizontal: 12, paddingVertical: 8, gap: 8,
+    backgroundColor: COLORS.surface, borderBottomWidth: 1, borderBottomColor: COLORS.border,
+  },
+  pinnedBarText: { flex: 1, fontSize: FONTS.sizes.sm, color: COLORS.primaryLight, fontWeight: FONTS.weights.medium },
+
+  // Star button
+  starBtn: { padding: 8, marginRight: 4 },
+
+  // Starred messages modal
+  starredList: { maxHeight: 400 },
+  starredItem: { padding: 12, borderBottomWidth: 1, borderBottomColor: COLORS.border },
+  starredItemHeader: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 4 },
+  starredSender: { fontSize: FONTS.sizes.xs, fontWeight: FONTS.weights.bold, color: COLORS.primaryLight },
+  starredTime: { fontSize: FONTS.sizes.xs, color: COLORS.textMuted },
+  starredContent: { fontSize: FONTS.sizes.sm, color: COLORS.textPrimary },
+
+  // Search bar
+  searchBar: {
+    flexDirection: 'row', alignItems: 'center', paddingHorizontal: 12, paddingVertical: 8, gap: 8,
+    backgroundColor: COLORS.surface, borderBottomWidth: 1, borderBottomColor: COLORS.border,
+  },
+  searchInput: { flex: 1, color: COLORS.textPrimary, fontSize: FONTS.sizes.md, paddingVertical: 6 },
+
+  // Group admin
+  groupNameEditRow: { flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 4 },
+  groupNameInput: { fontSize: FONTS.sizes.xl, fontWeight: FONTS.weights.bold, color: COLORS.textPrimary, borderBottomWidth: 1, borderBottomColor: COLORS.primary, paddingVertical: 4, minWidth: 150 },
+  groupNameSaveBtn: { padding: 4 },
+  editGroupNameHint: { fontSize: FONTS.sizes.xs, color: COLORS.textMuted, textAlign: 'center', marginTop: 2 },
+  removeMemberBtn: { padding: 8, borderRadius: 16, backgroundColor: 'rgba(196,75,75,0.1)', alignItems: 'center', justifyContent: 'center' },
 });
