@@ -276,6 +276,33 @@ class PasskeyChange(BaseModel):
     old_passkey: str
     new_passkey: str = Field(min_length=8, max_length=128)
 
+class PublicKeyUpload(BaseModel):
+    public_key: str = Field(min_length=10, max_length=100)
+    fingerprint: Optional[str] = Field(default=None, max_length=100)
+
+class EncryptedMessageSend(BaseModel):
+    chat_id: str
+    ciphertext: str = Field(min_length=1, max_length=50000)
+    nonce: str = Field(min_length=1, max_length=100)
+    dh_public: Optional[str] = Field(default=None, max_length=100)
+    msg_num: int = 0
+    message_type: str = "text"
+    security_level: str = "UNCLASSIFIED"
+    self_destruct_seconds: Optional[int] = Field(default=None, ge=5, le=604800)
+    is_emergency: bool = False
+    @field_validator('security_level')
+    @classmethod
+    def validate_sec(cls, v: str) -> str:
+        if v not in VALID_SECURITY_LEVELS:
+            raise ValueError(f'Ungültige Sicherheitsstufe.')
+        return v
+    @field_validator('message_type')
+    @classmethod
+    def validate_msg_type(cls, v: str) -> str:
+        if v not in VALID_MESSAGE_TYPES:
+            raise ValueError(f'Ungültiger Nachrichtentyp.')
+        return v
+
 # ==================== HELPERS ====================
 
 def hash_password(password: str) -> str:
@@ -1074,6 +1101,93 @@ async def magic_qr_poll(sid, data):
     if doc and doc.get("used"):
         await sio.emit("magic_qr_verified", {"success": True}, to=sid)
 
+# ==================== E2EE: KEY MANAGEMENT ====================
+
+@api_router.post("/keys/upload")
+async def upload_public_key(input: PublicKeyUpload, request: Request, user: dict = Depends(get_current_user)):
+    """Upload user's E2EE public key (X25519, base64-encoded)"""
+    if not BASE64_REGEX.match(input.public_key):
+        raise HTTPException(status_code=400, detail="Ungültiger Public Key")
+    await db.user_keys.update_one(
+        {"user_id": user["id"]},
+        {"$set": {
+            "public_key": input.public_key,
+            "fingerprint": input.fingerprint,
+            "updated_at": datetime.now(timezone.utc),
+        }},
+        upsert=True
+    )
+    await audit_log("key_uploaded", user["id"], request.client.host if request.client else "unknown")
+    return {"message": "Public key gespeichert"}
+
+@api_router.get("/keys/{user_id}")
+async def get_user_key(user_id: str, user: dict = Depends(get_current_user)):
+    """Get another user's public key for E2EE session initialization"""
+    key_doc = await db.user_keys.find_one({"user_id": user_id})
+    if not key_doc:
+        raise HTTPException(status_code=404, detail="Public key nicht gefunden")
+    return {
+        "user_id": user_id,
+        "public_key": key_doc["public_key"],
+        "fingerprint": key_doc.get("fingerprint"),
+        "updated_at": key_doc.get("updated_at"),
+    }
+
+@api_router.get("/keys/batch")
+async def get_user_keys_batch(user_ids: str, user: dict = Depends(get_current_user)):
+    """Get multiple users' public keys in one request"""
+    ids = [uid.strip() for uid in user_ids.split(",") if uid.strip()]
+    keys = await db.user_keys.find({"user_id": {"$in": ids}}).to_list(100)
+    result = {}
+    for k in keys:
+        result[k["user_id"]] = {
+            "public_key": k["public_key"],
+            "fingerprint": k.get("fingerprint"),
+        }
+    return {"keys": result}
+
+# ==================== E2EE: ENCRYPTED MESSAGES ====================
+
+@api_router.post("/messages/encrypted")
+async def send_encrypted_message(input: EncryptedMessageSend, user: dict = Depends(get_current_user)):
+    """Send an E2EE encrypted message. Backend only sees ciphertext."""
+    chat = await db.chats.find_one({"_id": ObjectId(input.chat_id), "participant_ids": ObjectId(user["id"])})
+    if not chat:
+        raise HTTPException(status_code=404, detail="Chat nicht gefunden")
+    
+    if not BASE64_REGEX.match(input.ciphertext) or not BASE64_REGEX.match(input.nonce):
+        raise HTTPException(status_code=400, detail="Ungültige verschlüsselte Daten")
+    
+    now = datetime.now(timezone.utc)
+    msg_doc = {
+        "chat_id": input.chat_id,
+        "sender_id": user["id"],
+        "sender_name": user.get("name", "Unbekannt"),
+        "sender_callsign": user.get("callsign", ""),
+        "content": input.ciphertext,
+        "nonce": input.nonce,
+        "dh_public": input.dh_public,
+        "msg_num": input.msg_num,
+        "message_type": input.message_type,
+        "security_level": input.security_level,
+        "self_destruct_seconds": input.self_destruct_seconds,
+        "self_destruct_at": (now + timedelta(seconds=input.self_destruct_seconds)) if input.self_destruct_seconds else None,
+        "is_emergency": input.is_emergency,
+        "status": "sent",
+        "delivered_to": [],
+        "read_by": [user["id"]],
+        "created_at": now,
+        "encrypted": True,
+        "e2ee": True,
+    }
+    result = await db.messages.insert_one(msg_doc)
+    msg_doc["_id"] = result.inserted_id
+    serialized = serialize_message(msg_doc)
+    
+    await ws_emit_to_chat(input.chat_id, 'message:new', serialized)
+    
+    return {"message": serialized}
+
 # ==================== STARTUP ====================
 
 @app.on_event("startup")
@@ -1094,6 +1208,7 @@ async def startup():
     await db.audit_log.create_index("timestamp")
     await db.magic_tokens.create_index("token")
     await db.magic_tokens.create_index("expires_at", expireAfterSeconds=0)
+    await db.user_keys.create_index("user_id", unique=True)
     
     # Seed anonymous demo users
     for udata in [

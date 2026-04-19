@@ -126,10 +126,19 @@ SS-Note/
 | `POST` | `/api/chats` | Neuen Chat/Gruppe erstellen |
 | `GET`  | `/api/chats/{id}` | Chat-Details |
 | `GET`  | `/api/messages/{chatId}` | Nachrichten laden |
-| `POST` | `/api/messages` | Nachricht senden |
+| `POST` | `/api/messages` | Nachricht senden (Plaintext) |
+| `POST` | `/api/messages/encrypted` | Nachricht senden (E2EE verschlüsselt) |
 | `POST` | `/api/messages/read` | Nachrichten als gelesen markieren |
 | `POST` | `/api/typing/{chatId}` | Tipp-Status senden |
 | `GET`  | `/api/typing/{chatId}` | Tipp-Status abrufen |
+
+### E2EE Key Management
+
+| Methode | Pfad | Beschreibung |
+|---------|------|-------------|
+| `POST` | `/api/keys/upload` | Public Key hochladen |
+| `GET`  | `/api/keys/{userId}` | Public Key eines Benutzers abrufen |
+| `GET`  | `/api/keys/batch` | Mehrere Public Keys auf einmal abrufen |
 
 ### WebSocket
 
@@ -149,6 +158,29 @@ pytest tests/ -v
 ```
 
 ## Sicherheit
+
+### Ende-zu-Ende-Verschlüsselung (E2EE)
+
+SS-Note implementiert ein **Double Ratchet-ähnliches Protokoll** für maximale Sicherheit:
+
+| Komponente | Algorithmus | Zweck |
+|---|---|---|
+| **Key Exchange** | X25519 (Curve25519) | Sichere Schlüsselvereinbarung |
+| **Verschlüsselung** | XSalsa20-Poly1305 | Authentifizierte Verschlüsselung |
+| **Key Derivation** | HKDF (HMAC-SHA256) | Sichere Schlüsselableitung |
+| **Forward Secrecy** | Double Ratchet | Jede Nachricht hat einen eigenen Schlüssel |
+| **Key Storage** | Expo SecureStore | iOS Keychain / Android Keystore |
+| **Key Verification** | Safety Numbers | Fingerprint-Vergleich wie bei Signal |
+
+**Ablauf:**
+1. Bei Login/Registrierung wird ein X25519-KeyPair generiert und im SecureStore gespeichert
+2. Der Public Key wird an das Backend übermittelt
+3. Beim Öffnen eines 1:1-Chats wird eine E2EE-Session per X25519 DH initialisiert
+4. Jede Nachricht wird client-seitig verschlüsselt — das Backend sieht nur Ciphertext
+5. Pro Nachricht wird ein neuer DH-Key generiert (Forward Secrecy)
+6. Safety Numbers ermöglichen Man-in-the-Middle-Erkennung
+
+### Zusätzliche Sicherheitsmaßnahmen
 
 - **bcrypt mit 12 Rounds** für Passkey-Hashing
 - **JWT mit Token-Rotation** — Refresh-Token werden bei jeder Nutzung erneuert

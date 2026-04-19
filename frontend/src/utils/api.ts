@@ -105,4 +105,25 @@ export const typingAPI = {
   get: (chatId: string) => api.get(`/typing/${chatId}`),
 };
 
+export const keysAPI = {
+  upload: (publicKey: string, fingerprint?: string) =>
+    api.post('/keys/upload', { public_key: publicKey, fingerprint }),
+  get: (userId: string) => api.get(`/keys/${userId}`),
+  getBatch: (userIds: string[]) => api.get('/keys/batch', { params: { user_ids: userIds.join(',') } }),
+};
+
+export const encryptedMessagesAPI = {
+  send: (data: {
+    chat_id: string;
+    ciphertext: string;
+    nonce: string;
+    dh_public?: string | null;
+    msg_num?: number;
+    message_type?: string;
+    security_level?: string;
+    self_destruct_seconds?: number | null;
+    is_emergency?: boolean;
+  }) => api.post('/messages/encrypted', data),
+};
+
 export default api;

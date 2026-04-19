@@ -7,8 +7,18 @@ import { useLocalSearchParams, useRouter } from 'expo-router';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import { useAuth } from '../../src/context/AuthContext';
-import { messagesAPI, chatsAPI, typingAPI, contactsAPI } from '../../src/utils/api';
+import { messagesAPI, chatsAPI, typingAPI, contactsAPI, keysAPI, encryptedMessagesAPI } from '../../src/utils/api';
 import { COLORS, FONTS, SPACING, SECURITY_LEVELS } from '../../src/utils/theme';
+import {
+  ensureKeyPair,
+  getKeyFingerprint,
+  getCombinedFingerprint,
+  initializeSession,
+  ratchetEncrypt,
+  ratchetDecrypt,
+  sharedSecret,
+} from '../../utils/crypto';
+import nacl from 'tweetnacl';
 
 export default function ChatDetailScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
@@ -26,9 +36,13 @@ export default function ChatDetailScreen() {
   const [showGroupInfo, setShowGroupInfo] = useState(false);
   const [groupMembers, setGroupMembers] = useState<any[]>([]);
   const [contacts, setContacts] = useState<any[]>([]);
+  const [isE2EESessionActive, setIsE2EESessionActive] = useState(false);
+  const [e2eeFingerprint, setE2eeFingerprint] = useState<string | null>(null);
+  const [showFingerprint, setShowFingerprint] = useState(false);
   const flatListRef = useRef<FlatList>(null);
   const typingTimer = useRef<any>(null);
   const lastMsgId = useRef<string | null>(null);
+  const e2eeSessionRef = useRef<boolean>(false);
 
   const loadChat = useCallback(async () => {
     if (!id) return;
@@ -37,7 +51,18 @@ export default function ChatDetailScreen() {
         chatsAPI.get(id), messagesAPI.list(id, 50),
       ]);
       setChat(chatRes.data.chat);
-      setMessages(msgsRes.data.messages || []);
+      
+      const decryptedMessages = [];
+      for (const msg of (msgsRes.data.messages || [])) {
+        if (msg.e2ee && msg.content && msg.nonce) {
+          const decrypted = await ratchetDecrypt(msg.content, msg.nonce, id, msg.dh_public || null);
+          decryptedMessages.push({ ...msg, content: decrypted || '[Entschlüsselung fehlgeschlagen]', _decrypted: true });
+        } else {
+          decryptedMessages.push(msg);
+        }
+      }
+      setMessages(decryptedMessages);
+      
       if (msgsRes.data.messages?.length > 0) {
         lastMsgId.current = msgsRes.data.messages[msgsRes.data.messages.length - 1].id;
         const unread = msgsRes.data.messages
@@ -48,6 +73,10 @@ export default function ChatDetailScreen() {
       if (chatRes.data.chat?.is_group) {
         setGroupMembers(chatRes.data.chat.participants || []);
       }
+      
+      if (!chatRes.data.chat?.is_group) {
+        await initE2EESession(chatRes.data.chat);
+      }
     } catch (e) {
       console.log('Error loading chat', e);
     } finally {
@@ -57,17 +86,48 @@ export default function ChatDetailScreen() {
 
   useEffect(() => { loadChat(); }, [loadChat]);
 
+  const initE2EESession = async (chatData: any) => {
+    try {
+      const otherParticipant = chatData?.participants?.find((p: any) => p.id !== user?.id);
+      if (!otherParticipant) return;
+      
+      const keyRes = await keysAPI.get(otherParticipant.id);
+      const theirPublicKey = nacl.decodeBase64(keyRes.data.public_key);
+      const ourKeyPair = await ensureKeyPair();
+      
+      await initializeSession(ourKeyPair, theirPublicKey, id!);
+      e2eeSessionRef.current = true;
+      setIsE2EESessionActive(true);
+      
+      const fingerprint = getCombinedFingerprint(ourKeyPair.publicKey, theirPublicKey);
+      setE2eeFingerprint(fingerprint);
+    } catch (e) {
+      console.log('E2EE session init failed, falling back to plaintext', e);
+      e2eeSessionRef.current = false;
+      setIsE2EESessionActive(false);
+    }
+  };
+
   useEffect(() => {
     if (!id) return;
     const interval = setInterval(async () => {
       try {
         const res = await messagesAPI.poll(id, lastMsgId.current || undefined);
         if (res.data.messages?.length > 0) {
+          const newMsgs = [];
+          for (const msg of res.data.messages) {
+            if (msg.e2ee && msg.content && msg.nonce) {
+              const decrypted = await ratchetDecrypt(msg.content, msg.nonce, id, msg.dh_public || null);
+              newMsgs.push({ ...msg, content: decrypted || '[Entschlüsselung fehlgeschlagen]', _decrypted: true });
+            } else {
+              newMsgs.push(msg);
+            }
+          }
           setMessages(prev => {
             const existingIds = new Set(prev.map(m => m.id));
-            const newMsgs = res.data.messages.filter((m: any) => !existingIds.has(m.id));
-            if (newMsgs.length === 0) return prev;
-            return [...prev, ...newMsgs];
+            const filteredNew = newMsgs.filter((m: any) => !existingIds.has(m.id));
+            if (filteredNew.length === 0) return prev;
+            return [...prev, ...filteredNew];
           });
           const lastNew = res.data.messages[res.data.messages.length - 1];
           lastMsgId.current = lastNew.id;
@@ -87,14 +147,36 @@ export default function ChatDetailScreen() {
     if (!text.trim() || !id) return;
     setSending(true);
     try {
-      const res = await messagesAPI.send({
-        chat_id: id,
-        content: text.trim(),
-        security_level: securityLevel,
-        self_destruct_seconds: selfDestruct,
-      });
-      setMessages(prev => [...prev, res.data.message]);
-      lastMsgId.current = res.data.message.id;
+      if (e2eeSessionRef.current && !chat?.is_group) {
+        const encrypted = await ratchetEncrypt(text.trim(), id);
+        if (encrypted) {
+          const res = await encryptedMessagesAPI.send({
+            chat_id: id,
+            ciphertext: encrypted.ciphertext,
+            nonce: encrypted.nonce,
+            dh_public: encrypted.dhPublic,
+            msg_num: encrypted.msgNum,
+            security_level: securityLevel,
+            self_destruct_seconds: selfDestruct,
+          });
+          const msg = res.data.message;
+          msg.content = text.trim();
+          msg._e2ee_sent = true;
+          setMessages(prev => [...prev, msg]);
+          lastMsgId.current = msg.id;
+        } else {
+          throw new Error('Encryption failed');
+        }
+      } else {
+        const res = await messagesAPI.send({
+          chat_id: id,
+          content: text.trim(),
+          security_level: securityLevel,
+          self_destruct_seconds: selfDestruct,
+        });
+        setMessages(prev => [...prev, res.data.message]);
+        lastMsgId.current = res.data.message.id;
+      }
       setText('');
       setSelfDestruct(null);
     } catch (e) {
@@ -288,7 +370,7 @@ export default function ChatDetailScreen() {
         <TouchableOpacity testID="chat-back-btn" onPress={() => router.back()} style={styles.backBtn}>
           <Ionicons name="chevron-back" size={24} color={COLORS.textPrimary} />
         </TouchableOpacity>
-        <TouchableOpacity style={styles.headerInfo} onPress={() => { if (chat?.is_group) { setShowGroupInfo(true); loadContacts(); } }}>
+        <TouchableOpacity style={styles.headerInfo} onPress={() => { if (chat?.is_group) { setShowGroupInfo(true); loadContacts(); } else if (isE2EESessionActive) { setShowFingerprint(!showFingerprint); } }}>
           <View style={styles.headerTitleRow}>
             <View style={[styles.headerAvatar, { backgroundColor: chat?.is_group ? `${getAvatarColor(id || '')}33` : COLORS.surfaceLight }]}>
               <Ionicons name={chat?.is_group ? 'people' : 'person'} size={16} color={chat?.is_group ? getAvatarColor(id || '') : COLORS.textSecondary} />
@@ -299,10 +381,16 @@ export default function ChatDetailScreen() {
             </View>
           </View>
         </TouchableOpacity>
-        <View style={[styles.secIndicator, { backgroundColor: `${getSecColor(chat?.security_level || 'UNCLASSIFIED')}22`, borderColor: getSecColor(chat?.security_level || 'UNCLASSIFIED') }]}>
-          <Ionicons name="shield-checkmark" size={12} color={getSecColor(chat?.security_level || 'UNCLASSIFIED')} />
-          <Text style={[styles.secIndicatorText, { color: getSecColor(chat?.security_level || 'UNCLASSIFIED') }]}>E2E</Text>
-        </View>
+        {isE2EESessionActive && (
+          <View style={[styles.secIndicator, { backgroundColor: '#1B5E20', borderColor: '#4CAF50' }]}>
+            <Ionicons name="lock-closed" size={12} color="#4CAF50" />
+          </View>
+        )}
+        {!isE2EESessionActive && (
+          <View style={[styles.secIndicator, { backgroundColor: `${COLORS.warning}22`, borderColor: COLORS.warning }]}>
+            <Ionicons name="lock-open" size={12} color={COLORS.warning} />
+          </View>
+        )}
       </View>
 
       <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : 'height'} style={styles.flex} keyboardVerticalOffset={0}>
@@ -318,10 +406,16 @@ export default function ChatDetailScreen() {
           ListEmptyComponent={
             <View style={styles.emptyMessages}>
               <View style={styles.emptyIconCircle}>
-                <Ionicons name="lock-closed" size={32} color={COLORS.primaryLight} />
+                <Ionicons name={isE2EESessionActive ? 'lock-closed' : 'lock-open'} size={32} color={isE2EESessionActive ? '#4CAF50' : COLORS.primaryLight} />
               </View>
-              <Text style={styles.emptyText}>Verschlüsselter Kanal bereit</Text>
-              <Text style={styles.emptySubtext}>Nachrichten sind Ende-zu-Ende verschlüsselt</Text>
+              <Text style={styles.emptyText}>
+                {isE2EESessionActive ? 'Verschlüsselter Kanal bereit' : 'Kanal bereit'}
+              </Text>
+              <Text style={styles.emptySubtext}>
+                {isE2EESessionActive
+                  ? 'Nachrichten sind Ende-zu-Ende verschlüsselt (Double Ratchet)'
+                  : 'Tippe auf das Schloss oben rechts für E2EE-Info'}
+              </Text>
             </View>
           }
         />
@@ -470,6 +564,57 @@ export default function ChatDetailScreen() {
           </View>
         </SafeAreaView>
       </Modal>
+
+      {/* E2EE Fingerprint Modal */}
+      <Modal visible={showFingerprint} animationType="slide" transparent>
+        <SafeAreaView style={styles.modalOverlay} edges={['top', 'bottom']}>
+          <View style={styles.modalContent}>
+            <View style={styles.modalHeader}>
+              <Text style={styles.modalTitle}>Verschlüsselung</Text>
+              <TouchableOpacity onPress={() => setShowFingerprint(false)}>
+                <Ionicons name="close" size={24} color={COLORS.textPrimary} />
+              </TouchableOpacity>
+            </View>
+
+            <View style={styles.e2eeInfo}>
+              <View style={styles.e2eeLockIcon}>
+                <Ionicons name="lock-closed" size={48} color="#4CAF50" />
+              </View>
+              <Text style={styles.e2eeTitle}>Ende-zu-Ende verschlüsselt</Text>
+              <Text style={styles.e2eeDesc}>
+                Nachrichten in diesem Chat sind mit dem Double Ratchet Protocol verschlüsselt.
+                Niemand außerhalb dieses Chats kann sie lesen.
+              </Text>
+            </View>
+
+            {e2eeFingerprint && (
+              <View style={styles.fingerprintSection}>
+                <Text style={styles.fingerprintLabel}>SAFETY NUMBER</Text>
+                <Text style={styles.fingerprintValue}>{e2eeFingerprint}</Text>
+                <Text style={styles.fingerprintHint}>
+                  Vergleiche diesen Code mit {getOtherParticipant()?.name || 'deinem Kontakt'} um Man-in-the-Middle-Angriffe zu erkennen.
+                </Text>
+              </View>
+            )}
+
+            <View style={styles.e2eeAlgo}>
+              <Text style={styles.e2eeAlgoLabel}>ALGORITHMEN</Text>
+              <View style={styles.algoItem}>
+                <Ionicons name="key" size={14} color={COLORS.primaryLight} />
+                <Text style={styles.algoText}>X25519 (Key Exchange)</Text>
+              </View>
+              <View style={styles.algoItem}>
+                <Ionicons name="lock-closed" size={14} color={COLORS.primaryLight} />
+                <Text style={styles.algoText}>XSalsa20-Poly1305 (Encryption)</Text>
+              </View>
+              <View style={styles.algoItem}>
+                <Ionicons name="refresh" size={14} color={COLORS.primaryLight} />
+                <Text style={styles.algoText}>Double Ratchet (Forward Secrecy)</Text>
+              </View>
+            </View>
+          </View>
+        </SafeAreaView>
+      </Modal>
     </SafeAreaView>
   );
 }
@@ -596,4 +741,18 @@ const styles = StyleSheet.create({
   modalContactInfo: { flex: 1 },
   modalContactName: { fontSize: FONTS.sizes.base, fontWeight: FONTS.weights.semibold, color: COLORS.textPrimary },
   modalContactCallsign: { fontSize: FONTS.sizes.xs, color: COLORS.textSecondary },
+
+  // E2EE Fingerprint
+  e2eeInfo: { alignItems: 'center', padding: 24 },
+  e2eeLockIcon: { width: 80, height: 80, borderRadius: 40, backgroundColor: '#1B5E20', alignItems: 'center', justifyContent: 'center', marginBottom: 16 },
+  e2eeTitle: { fontSize: FONTS.sizes.xl, fontWeight: FONTS.weights.bold, color: '#4CAF50', marginBottom: 8 },
+  e2eeDesc: { fontSize: FONTS.sizes.sm, color: COLORS.textSecondary, textAlign: 'center', lineHeight: 20 },
+  fingerprintSection: { paddingHorizontal: 24, paddingVertical: 16, borderTopWidth: 1, borderTopColor: COLORS.border },
+  fingerprintLabel: { fontSize: FONTS.sizes.xs, fontWeight: FONTS.weights.bold, color: COLORS.textMuted, letterSpacing: 2, marginBottom: 8 },
+  fingerprintValue: { fontSize: FONTS.sizes.sm, color: COLORS.primaryLight, fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace', backgroundColor: COLORS.surface, padding: 12, borderRadius: 8, textAlign: 'center', letterSpacing: 1 },
+  fingerprintHint: { fontSize: FONTS.sizes.xs, color: COLORS.textMuted, marginTop: 12, textAlign: 'center', lineHeight: 18 },
+  e2eeAlgo: { paddingHorizontal: 24, paddingVertical: 16, borderTopWidth: 1, borderTopColor: COLORS.border },
+  e2eeAlgoLabel: { fontSize: FONTS.sizes.xs, fontWeight: FONTS.weights.bold, color: COLORS.textMuted, letterSpacing: 2, marginBottom: 12 },
+  algoItem: { flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 8 },
+  algoText: { fontSize: FONTS.sizes.sm, color: COLORS.textPrimary },
 });

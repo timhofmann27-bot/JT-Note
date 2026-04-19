@@ -38,6 +38,7 @@ export const COLORS = {
   inputBg: '#121212',
   danger: '#F44336',
   success: '#4CAF50',
+  warning: '#FF9800',
   white: '#FFFFFF',
 };
 

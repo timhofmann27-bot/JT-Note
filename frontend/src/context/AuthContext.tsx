@@ -1,5 +1,6 @@
 import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
-import { authAPI, setAuthToken, connectSocket, disconnectSocket } from '../utils/api';
+import { authAPI, keysAPI, setAuthToken, connectSocket, disconnectSocket } from '../utils/api';
+import { ensureKeyPair, getKeyFingerprint } from '../utils/crypto';
 
 type User = {
   id: string;
@@ -50,6 +51,16 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     setAuthToken(res.data.token);
     setUser(res.data.user);
     try { connectSocket(res.data.token); } catch {}
+    try {
+      const keyPair = await ensureKeyPair();
+      const fingerprint = getKeyFingerprint(keyPair.publicKey);
+      await keysAPI.upload(
+        btoa(String.fromCharCode(...keyPair.publicKey)),
+        fingerprint
+      );
+    } catch (e) {
+      console.log('Key upload failed, will retry later', e);
+    }
   };
 
   const register = async (username: string, passkey: string, name: string, callsign?: string) => {
@@ -57,6 +68,16 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     setAuthToken(res.data.token);
     setUser(res.data.user);
     try { connectSocket(res.data.token); } catch {}
+    try {
+      const keyPair = await ensureKeyPair();
+      const fingerprint = getKeyFingerprint(keyPair.publicKey);
+      await keysAPI.upload(
+        btoa(String.fromCharCode(...keyPair.publicKey)),
+        fingerprint
+      );
+    } catch (e) {
+      console.log('Key upload failed, will retry later', e);
+    }
   };
 
   const logout = async () => {
